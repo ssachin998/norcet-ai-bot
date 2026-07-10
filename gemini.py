@@ -1,15 +1,22 @@
 """
 NORCET AI Bot - Google Gemini API Module
 ======================================
-Handles communication with the Google Gemini 2.5 Flash API for
-generating NORCET-level MCQ questions.
+Handles communication with the Google Gemini 3.5 Flash API.
 
-Features:
-    - Structured JSON output
-    - Batch question generation
-    - Automatic retry with exponential backoff
-    - Difficulty-aware generation
-    - Duplicate-aware prompting
+Architecture (designed for Gemini Free Tier: 5 RPM limit):
+    - Every question is generated via ONE independent API call.
+    - Every explanation is generated via ONE independent API call.
+    - No batching, no preloading, no caching of questions.
+    - A rolling-window rate limiter guarantees at most 4 API calls
+      in any 60-second window, with a 1-request safety margin.
+    - HTTP 429 responses are parsed for retry_delay and handled
+      automatically without canceling the session.
+
+Session cycle (per question, 30 seconds):
+    00s  -> generate_single_question()   [API call]
+    15s  -> generate_explanation()       [API call]
+    30s  -> generate_single_question()  [API call, next Q]
+    45s  -> generate_explanation()       [API call, next Q]
 """
 
 import json
@@ -22,519 +29,472 @@ import google.generativeai as genai
 
 from config import Config
 from logger import log
-from database import get_all_question_hashes, generate_question_hash
+from database import generate_question_hash
 
 
-# ── Gemini Rate Limiter ─────────────────────────────────────
+# ── Rate Limiter ──────────────────────────────────────────────
 
 class GeminiRateLimiter:
     """
-    Token-bucket style rate limiter enforcing a maximum number of
-    Gemini API requests within a rolling time window.
+    Rolling-window rate limiter.
 
-    Guarantee: NEVER more than GEMINI_RATE_LIMIT_MAX requests
-    in any rolling GEMINI_RATE_LIMIT_WINDOW-second window.
-    If a request would exceed the limit, it blocks until a slot opens.
+    Guarantee: NEVER more than max_requests API calls within any
+    rolling window_seconds window.  If a request would breach the
+    limit, acquire() blocks until a slot opens.
     """
 
-    def __init__(self, max_requests: int = 4, window_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        max_requests: int = 4,
+        window_seconds: int = 60,
+    ) -> None:
         self._max = max_requests
         self._window = window_seconds
         self._timestamps: deque[float] = deque()
 
     async def acquire(self) -> None:
-        """
-        Block until a request slot is available.
-
-        Prunes stale timestamps, checks capacity, and sleeps
-        the exact remaining time if the window is full.
-        """
+        """Block until a request slot is available, then record it."""
         while True:
             now = time.monotonic()
-            # Prune timestamps outside the rolling window
-            while self._timestamps and (now - self._timestamps[0]) >= self._window:
+            # Prune timestamps that have fallen outside the window
+            while (
+                self._timestamps
+                and (now - self._timestamps[0]) >= self._window
+            ):
                 self._timestamps.popleft()
 
             if len(self._timestamps) < self._max:
                 self._timestamps.append(time.monotonic())
                 return
 
-            # Window is full — calculate exact wait until oldest slot frees
-            wait = self._window - (now - self._timestamps[0]) + 0.1
+            # Window full — wait for the oldest slot to expire
+            wait = self._window - (now - self._timestamps[0]) + 0.15
             log.info(
-                f"Gemini rate limit reached ({self._max}/{self._window}s). "
-                f"Waiting {wait:.1f}s for next slot..."
+                f"Gemini rate limiter: {self._max}/{self._window}s "
+                f"window full. Sleeping {wait:.1f}s …"
             )
             await asyncio.sleep(wait)
 
     @property
     def available_slots(self) -> int:
-        """How many requests can be made right now without waiting."""
+        """Number of requests that can fire right now without waiting."""
         now = time.monotonic()
-        while self._timestamps and (now - self._timestamps[0]) >= self._window:
+        while (
+            self._timestamps
+            and (now - self._timestamps[0]) >= self._window
+        ):
             self._timestamps.popleft()
         return self._max - len(self._timestamps)
 
+    def record_429(self) -> None:
+        """
+        Record an external 429 event.  Adds an extra timestamp so
+        the limiter backs off even if the 429 came from a call
+        that was already tracked.
+        """
+        self._timestamps.append(time.monotonic())
 
-# Module-level rate limiter instance
+
+# Module-level singleton
 gemini_rate_limiter = GeminiRateLimiter(
     max_requests=Config.GEMINI_RATE_LIMIT_MAX,
     window_seconds=Config.GEMINI_RATE_LIMIT_WINDOW,
 )
 
 
-# ── Gemini Prompt Templates ────────────────────────────────────
+# ── Prompt Templates ──────────────────────────────────────────
 
 SYSTEM_INSTRUCTION = (
     "You are a senior nursing professor and NORCET question paper setter "
-    "at AIIMS New Delhi. You have 20+ years of experience setting competitive "
-    "examination questions for B.Sc Nursing, Post Basic B.Sc Nursing, and "
-    "M.Sc Nursing entrance examinations (NORCET).\n\n"
-    "Your questions MUST:\n"
-    "- Resemble AIIMS NORCET Previous Year Questions in style and rigor\n"
-    "- Test clinical application, not mere recall\n"
-    "- Be factually accurate and evidence-based\n"
-    "- Have ONLY genuine references from standard textbooks (Robbins, KDT, "
-    "Apurba Sastry, Brunner, AIIMS Protocol, WHO guidelines, CDC guidelines)\n"
-    "- Never fabricate references\n"
-    "- Each option rationale must explain WHY it is correct or incorrect "
-    "with specific pathophysiological or clinical reasoning\n"
-    "- The 'pearl' field should contain a high-yield clinical pearl "
-    "relevant to the question concept\n"
-    "- Questions must be original and unique, never copied from any source\n"
-    "- Use proper medical terminology\n"
-    "- Avoid negative phrasing unless clinically necessary\n"
-    "- Every question must have exactly ONE correct answer\n\n"
-    "Return ONLY valid JSON array. No markdown, no explanation, no extra text."
+    "at AIIMS New Delhi. You have 20+ years of experience setting "
+    "competitive examination questions for B.Sc Nursing, Post Basic "
+    "B.Sc Nursing, and M.Sc Nursing entrance examinations (NORCET).\n\n"
+    "Rules:\n"
+    "- Resemble AIIMS NORCET Previous Year Questions.\n"
+    "- Test clinical application, not mere recall.\n"
+    "- Be factually accurate and evidence-based.\n"
+    "- Use ONLY genuine references: Robbins, KDT, Apurba Sastry, "
+    "Brunner, AIIMS Protocol, WHO, CDC.\n"
+    "- Never fabricate references.\n"
+    "- Questions must be original and unique.\n"
+    "- Use proper medical terminology.\n"
+    "- Every question must have exactly ONE correct answer.\n"
 )
 
-MCQ_GENERATION_PROMPT = """
-Generate {count} NORCET-level Multiple Choice Questions on the topic: "{topic}"
 
-Difficulty distribution for this batch:
-- Easy: {easy_pct}% (straightforward, tests basic knowledge)
-- Moderate: {moderate_pct}% (requires clinical reasoning, application-level)
-- Hard: {hard_pct}% (tests deep understanding, multi-concept integration)
+SINGLE_MCQ_PROMPT = """
+Generate exactly ONE NORCET-level Multiple Choice Question on the topic: "{topic}"
 
-IMPORTANT REQUIREMENTS:
-1. Return a JSON array of exactly {count} question objects.
-2. Each object must have EXACTLY these fields:
-   - "question": The question text (string)
-   - "optionA": First option (string)
-   - "optionB": Second option (string)
-   - "optionC": Third option (string)
-   - "optionD": Fourth option (string)
-   - "correct_answer": The correct option letter, exactly "A", "B", "C", or "D"
-   - "rationaleA": Detailed explanation of why option A is correct or incorrect
-   - "rationaleB": Detailed explanation of why option B is correct or incorrect
-   - "rationaleC": Detailed explanation of why option C is correct or incorrect
-   - "rationaleD": Detailed explanation of why option D is correct or incorrect
-   - "pearl": A high-yield NORCET pearl/tip related to this question concept
-   - "memory_trick": A mnemonic or memory aid to help remember the answer
-   - "reference": Genuine textbook reference with edition and page if possible
-     (Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC)
-   - "difficulty": "Easy", "Moderate", or "Hard"
+Difficulty level: {difficulty}
 
-3. The rationales must be DETAILED clinical explanations, not one-liners.
-4. Each rationale should be 2-4 sentences explaining the pathophysiology,
-   pharmacology, or clinical reasoning.
-5. References must be REAL. If you cite Robbins, cite the specific chapter/concept.
-6. Never generate similar questions or questions you've generated before.
+Return a single JSON object (NOT an array) with EXACTLY these fields:
+{{
+  "question": "The question text",
+  "optionA": "First option",
+  "optionB": "Second option",
+  "optionC": "Third option",
+  "optionD": "Fourth option",
+  "correct_answer": "The correct option letter — exactly A, B, C, or D",
+  "difficulty": "{difficulty}"
+}}
 
-{existing_hashes_note}
+Requirements:
+- The question must test clinical application.
+- All four options must be plausible.
+- The correct answer must be unambiguously correct.
+- Never repeat a question pattern you have generated before.
 
-Return ONLY the JSON array. No markdown fences, no commentary.
-Example format:
-[
-  {{
-    "question": "A 45-year-old patient...",
-    "optionA": "...",
-    "optionB": "...",
-    "optionC": "...",
-    "optionD": "...",
-    "correct_answer": "B",
-    "rationaleA": "...",
-    "rationaleB": "...",
-    "rationaleC": "...",
-    "rationaleD": "...",
-    "pearl": "...",
-    "memory_trick": "...",
-    "reference": "Robbins Basic Pathology, 10th Edition, Chapter 5",
-    "difficulty": "Moderate"
-  }}
-]
+Return ONLY the JSON object. No markdown, no explanation, no code fences.
 """
 
 
+SINGLE_EXPLANATION_PROMPT = """
+Given this NORCET MCQ question, generate a detailed explanation.
+
+Question: {question}
+Option A: {optionA}
+Option B: {optionB}
+Option C: {optionC}
+Option D: {optionD}
+Correct Answer: {correct_answer}
+Topic: {topic}
+
+Return a single JSON object (NOT an array) with EXACTLY these fields:
+{{
+  "correct_rationale": "Detailed explanation of why the correct answer is correct. Include pathophysiology, pharmacology, or clinical reasoning. 2-4 sentences.",
+  "rationale_wrong_options": {{
+    "A": "Why option A is wrong (2-3 sentences)",
+    "B": "Why option B is wrong (2-3 sentences)",
+    "C": "Why option C is wrong (2-3 sentences)",
+    "D": "Why option D is wrong (2-3 sentences)"
+  }},
+  "memory_trick": "A mnemonic or memory aid to remember the answer. Keep it short and catchy.",
+  "pearl": "A high-yield NORCET exam point related to this question concept.",
+  "reference": "Genuine textbook reference. Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC."
+}}
+
+Requirements:
+- Each rationale must explain WHY with clinical reasoning.
+- The memory trick must be a practical mnemonic.
+- The pearl must be exam-relevant.
+- The reference must be a REAL textbook citation.
+
+Return ONLY the JSON object. No markdown, no explanation, no code fences.
+"""
+
+
+# ── Helper: parse a single JSON object from free-form text ──
+
+def _extract_single_json(raw_text: str) -> dict:
+    """
+    Extract a single JSON object from Gemini response text.
+    Handles markdown fences, surrounding text, and raw JSON.
+    """
+    text = raw_text.strip()
+
+    # Strip markdown code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+
+    # Try direct parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Extract first { … } block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    raise ValueError(
+        f"Cannot extract JSON object from Gemini response. "
+        f"Response starts with: {text[:200]}"
+    )
+
+
+# ── Client ────────────────────────────────────────────────────
+
 class GeminiClient:
     """
-    Client for Google Gemini API to generate NORCET MCQ questions.
-
-    Handles API initialization, question generation with retry logic,
-    JSON parsing, and validation of generated questions.
+    Gemini API client for independent single-question and
+    single-explanation generation with rolling-window rate limiting
+    and HTTP 429 retry handling.
     """
 
     def __init__(self) -> None:
-        self._model: Optional[genai.GenerativeModel] = None
+        self._mcq_model: Optional[genai.GenerativeModel] = None
+        self._expl_model: Optional[genai.GenerativeModel] = None
         self._initialized: bool = False
         self._rate_limiter: GeminiRateLimiter = gemini_rate_limiter
 
+    # ── Initialization ───────────────────────────────────────
+
     def _initialize(self) -> None:
-        """Initialize the Gemini API client. Called lazily."""
+        """Configure the API and create both models. Called lazily."""
         if self._initialized:
             return
 
         genai.configure(api_key=Config.GEMINI_API_KEY)
 
-        generation_config = genai.GenerationConfig(
-            temperature=Config.GEMINI_TEMPERATURE,
-            response_mime_type="application/json",
-        )
-
-        self._model = genai.GenerativeModel(
+        # MCQ model — strict JSON output
+        self._mcq_model = genai.GenerativeModel(
             model_name=Config.GEMINI_MODEL,
             system_instruction=SYSTEM_INSTRUCTION,
-            generation_config=generation_config,
+            generation_config=genai.GenerationConfig(
+                temperature=Config.GEMINI_TEMPERATURE,
+                response_mime_type="application/json",
+            ),
         )
-        self._initialized = True
-        log.info(f"Gemini client initialized with model: {Config.GEMINI_MODEL}")
 
-    def _generate_prompt(
-        self,
-        topic: str,
-        count: int,
-        difficulties: Optional[list[str]] = None,
+        # Explanation model — strict JSON output
+        self._expl_model = genai.GenerativeModel(
+            model_name=Config.GEMINI_MODEL,
+            system_instruction=SYSTEM_INSTRUCTION,
+            generation_config=genai.GenerationConfig(
+                temperature=0.7,
+                response_mime_type="application/json",
+            ),
+        )
+
+        self._initialized = True
+        log.info(
+            f"Gemini client initialized — model: {Config.GEMINI_MODEL}, "
+            f"rate limit: {Config.GEMINI_RATE_LIMIT_MAX} req / "
+            f"{Config.GEMINI_RATE_LIMIT_WINDOW}s"
+        )
+
+    # ── Core: call Gemini with rate-limit + 429 handling ─────
+
+    async def _call_gemini(
+        self, model: genai.GenerativeModel, prompt: str
     ) -> str:
         """
-        Generate the full prompt for the Gemini API call.
+        Low-level: rate-limited Gemini call with HTTP 429 handling.
 
-        Args:
-            topic: The NORCET topic to generate questions for.
-            count: Number of questions to generate.
-            difficulties: Optional list of difficulty labels for each question.
+        Flow:
+        1. acquire() rate-limiter slot
+        2. Run the API call in an executor
+        3. On 429 → read retry_delay → wait → record_429 → retry
+        4. On other errors → retry up to GEMINI_MAX_RETRIES
 
-        Returns:
-            The formatted prompt string.
-        """
-        if difficulties:
-            easy_pct = round(difficulties.count("Easy") / count * 100)
-            moderate_pct = round(difficulties.count("Moderate") / count * 100)
-            hard_pct = round(difficulties.count("Hard") / count * 100)
-        else:
-            easy_pct = round(Config.DIFFICULTY_EASY * 100)
-            moderate_pct = round(Config.DIFFICULTY_MODERATE * 100)
-            hard_pct = round(Config.DIFFICULTY_HARD * 100)
-
-        # Optionally include note about existing hashes
-        existing_hashes_note = ""
-        try:
-            all_hashes = get_all_question_hashes()
-            if all_hashes:
-                existing_hashes_note = (
-                    f"NOTE: The database already contains {len(all_hashes)} questions. "
-                    "Generate completely NEW and UNIQUE questions. Do not repeat "
-                    "any concepts or question patterns."
-                )
-        except Exception:
-            pass
-
-        return MCQ_GENERATION_PROMPT.format(
-            count=count,
-            topic=topic,
-            easy_pct=easy_pct,
-            moderate_pct=moderate_pct,
-            hard_pct=hard_pct,
-            existing_hashes_note=existing_hashes_note,
-        )
-
-    async def generate_questions(
-        self,
-        topic: str,
-        count: int,
-        difficulties: Optional[list[str]] = None,
-    ) -> list[dict]:
-        """
-        Generate NORCET MCQ questions using the Gemini API.
-
-        Args:
-            topic: The topic to generate questions for.
-            count: Number of questions to generate.
-            difficulties: Optional list of difficulty labels.
-
-        Returns:
-            List of validated question dictionaries.
-
-        Raises:
-            RuntimeError: If generation fails after all retries.
-            ValueError: If the API returns invalid data.
+        Returns the raw response text.
+        Raises RuntimeError after exhausting retries.
         """
         self._initialize()
 
-        prompt = self._generate_prompt(topic, count, difficulties)
         last_error: Exception | None = None
 
         for attempt in range(1, Config.GEMINI_MAX_RETRIES + 1):
+            # Step 1: wait for our rate-limiter
+            await self._rate_limiter.acquire()
+
             try:
-                log.info(
-                    f"Generating {count} questions for topic '{topic}' "
-                    f"(attempt {attempt}/{Config.GEMINI_MAX_RETRIES})"
-                )
-
-                # Wait for rate limiter before making the API call
-                await self._rate_limiter.acquire()
-
-                # Run synchronous Gemini call in executor to avoid blocking
                 loop = asyncio.get_event_loop()
                 response = await loop.run_in_executor(
-                    None,
-                    self._model.generate_content,  # type: ignore
-                    prompt,
+                    None, model.generate_content, prompt
                 )
+                return response.text
 
-                raw_text = response.text
-                questions = self._parse_response(raw_text)
-                validated = self._validate_questions(questions, topic)
+            except Exception as exc:
+                last_error = exc
+                exc_str = str(exc)
 
-                log.info(
-                    f"Successfully generated {len(validated)} valid questions "
-                    f"for topic '{topic}'"
-                )
-                return validated
+                # ── Handle HTTP 429 (Rate Limit) ───────────
+                if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower():
+                    # Try to parse Google's retry_delay hint
+                    retry_delay = Config.GEMINI_RETRY_DELAY
+                    try:
+                        if hasattr(exc, "response") and exc.response is not None:
+                            error_info = exc.response
+                            if hasattr(error_info, "json"):
+                                info = error_info.json()
+                                retry_delay = float(
+                                    info.get("error", {})
+                                    .get("details", [{}])[0]
+                                    .get("retryDelay", {})
+                                    .get("seconds", Config.GEMINI_RETRY_DELAY)
+                                )
+                        elif hasattr(exc, "message"):
+                            import re as _re
+                            m = _re.search(r"retryDelay.*?(\d+(?:\.\d+)?)", exc_str)
+                            if m:
+                                retry_delay = float(m.group(1))
+                    except Exception:
+                        pass
 
-            except json.JSONDecodeError as e:
-                last_error = e
+                    log.warning(
+                        f"Gemini 429 Rate Limit (attempt {attempt}). "
+                        f"retry_delay={retry_delay}s. Waiting …"
+                    )
+                    # Record the 429 so the rate limiter also backs off
+                    self._rate_limiter.record_429()
+                    await asyncio.sleep(retry_delay + 0.5)
+                    continue  # retry same call
+
+                # ── Other errors ────────────────────────────
                 log.warning(
-                    f"JSON parse error on attempt {attempt}: {e}. "
-                    "Attempting cleanup and retry..."
-                )
-                if attempt < Config.GEMINI_MAX_RETRIES:
-                    await asyncio.sleep(Config.GEMINI_RETRY_DELAY * attempt)
-
-            except Exception as e:
-                last_error = e
-                log.warning(
-                    f"Gemini API error on attempt {attempt}: {type(e).__name__}: {e}"
+                    f"Gemini API error (attempt {attempt}/{Config.GEMINI_MAX_RETRIES}): "
+                    f"{type(exc).__name__}: {exc}"
                 )
                 if attempt < Config.GEMINI_MAX_RETRIES:
                     await asyncio.sleep(Config.GEMINI_RETRY_DELAY * attempt)
 
         raise RuntimeError(
-            f"Failed to generate questions after {Config.GEMINI_MAX_RETRIES} attempts. "
-            f"Last error: {last_error}"
+            f"Gemini API call failed after {Config.GEMINI_MAX_RETRIES} "
+            f"attempts. Last error: {last_error}"
         )
 
-    def _parse_response(self, raw_text: str) -> list[dict]:
-        """
-        Parse the Gemini API response text into a list of question dicts.
+    # ── Public: generate ONE question ─────────────────────────
 
-        Handles various response formats:
-        - Clean JSON array
-        - Markdown-wrapped JSON
-        - Truncated responses with partial JSON
-
-        Args:
-            raw_text: Raw text response from Gemini.
-
-        Returns:
-            List of question dictionaries.
-
-        Raises:
-            json.JSONDecodeError: If the response cannot be parsed.
-        """
-        text = raw_text.strip()
-
-        # Remove markdown code fences if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove first line (```json) and last line (```)
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # Try direct parse
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict) and "questions" in data:
-                return data["questions"]
-            else:
-                raise json.JSONDecodeError(
-                    "Response is not a JSON array or object with 'questions' key",
-                    text, 0
-                )
-        except json.JSONDecodeError:
-            pass
-
-        # Try to extract JSON array from surrounding text
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                data = json.loads(text[start:end + 1])
-                if isinstance(data, list):
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        raise json.JSONDecodeError(
-            f"Could not extract valid JSON from response. "
-            f"Response starts with: {text[:200]}",
-            text, 0,
-        )
-
-    def _validate_questions(
-        self, questions: list[dict], topic: str
-    ) -> list[dict]:
-        """
-        Validate and clean generated questions.
-
-        Ensures each question has all required fields, valid values,
-        and no duplicates in the database.
-
-        Args:
-            questions: Raw list of question dicts from Gemini.
-            topic: Topic name for context.
-
-        Returns:
-            List of validated question dicts (duplicates removed).
-        """
-        required_fields = {
-            "question", "optionA", "optionB", "optionC", "optionD",
-            "correct_answer", "rationaleA", "rationaleB", "rationaleC",
-            "rationaleD", "pearl", "memory_trick", "reference", "difficulty",
-        }
-
-        valid_options = {"A", "B", "C", "D"}
-        valid_difficulties = {"Easy", "Moderate", "Hard"}
-        validated: list[dict] = []
-        duplicate_count = 0
-
-        for i, q in enumerate(questions):
-            # Check required fields
-            missing = required_fields - set(q.keys())
-            if missing:
-                log.warning(
-                    f"Question {i + 1} missing fields: {missing}. Skipping."
-                )
-                continue
-
-            # Validate correct_answer
-            correct = str(q["correct_answer"]).strip().upper()
-            if correct not in valid_options:
-                log.warning(
-                    f"Question {i + 1} has invalid correct_answer '{correct}'. Skipping."
-                )
-                continue
-
-            # Validate difficulty
-            difficulty = str(q.get("difficulty", "Moderate")).strip().title()
-            if difficulty not in valid_difficulties:
-                difficulty = "Moderate"
-
-            # Check for empty question text
-            if not q["question"].strip():
-                log.warning(f"Question {i + 1} has empty question text. Skipping.")
-                continue
-
-            # Check for duplicate in database
-            question_hash = generate_question_hash(q["question"])
-            try:
-                from database import is_duplicate
-                if is_duplicate(q["question"]):
-                    duplicate_count += 1
-                    log.info(f"Question {i + 1} is a duplicate. Skipping.")
-                    continue
-            except Exception as e:
-                log.warning(f"Duplicate check failed for question {i + 1}: {e}")
-
-            # Build clean question dict
-            clean_q = {
-                "question": q["question"].strip(),
-                "optionA": str(q["optionA"]).strip(),
-                "optionB": str(q["optionB"]).strip(),
-                "optionC": str(q["optionC"]).strip(),
-                "optionD": str(q["optionD"]).strip(),
-                "correct_answer": correct,
-                "rationaleA": str(q["rationaleA"]).strip(),
-                "rationaleB": str(q["rationaleB"]).strip(),
-                "rationaleC": str(q["rationaleC"]).strip(),
-                "rationaleD": str(q["rationaleD"]).strip(),
-                "pearl": str(q["pearl"]).strip(),
-                "memory_trick": str(q.get("memory_trick", "")).strip(),
-                "reference": str(q["reference"]).strip(),
-                "difficulty": difficulty,
-                "topic": topic,
-            }
-            validated.append(clean_q)
-
-        if duplicate_count > 0:
-            log.info(
-                f"Removed {duplicate_count} duplicate(s) from generated batch"
-            )
-
-        return validated
-
-    async def generate_batch(
+    async def generate_single_question(
         self,
         topic: str,
-        total_count: int,
-    ) -> list[dict]:
+        difficulty: str = "Moderate",
+    ) -> dict:
         """
-        Generate a large batch of questions by splitting into API calls
-        of Config.BATCH_SIZE each.
+        Generate exactly ONE MCQ question via a single Gemini API call.
 
         Args:
-            topic: Topic to generate questions for.
-            total_count: Total number of questions needed.
+            topic: The NORCET topic.
+            difficulty: "Easy", "Moderate", or "Hard".
 
         Returns:
-            Combined list of all validated question dicts.
+            Dict with keys: question, optionA-D, correct_answer, difficulty.
+            The dict will also have empty placeholder keys for explanation
+            fields (rationaleA-D, pearl, memory_trick, reference) so that
+            merge_explanation() can fill them in.
+
+        Raises:
+            RuntimeError: If generation fails after retries.
         """
-        all_questions: list[dict] = []
-        batches_needed = (total_count + Config.BATCH_SIZE - 1) // Config.BATCH_SIZE
-        questions_remaining = total_count
+        prompt = SINGLE_MCQ_PROMPT.format(topic=topic, difficulty=difficulty)
+        raw = await self._call_gemini(self._mcq_model, prompt)
+        data = _extract_single_json(raw)
 
-        for batch_num in range(batches_needed):
-            batch_size = min(Config.BATCH_SIZE, questions_remaining)
-            log.info(
-                f"Batch {batch_num + 1}/{batches_needed}: "
-                f"Generating {batch_size} questions"
-            )
+        # Validate
+        required = {"question", "optionA", "optionB", "optionC", "optionD", "correct_answer"}
+        missing = required - set(data.keys())
+        if missing:
+            raise ValueError(f"Generated question missing fields: {missing}")
 
-            try:
-                batch = await self.generate_questions(
-                    topic=topic,
-                    count=batch_size,
-                )
-                all_questions.extend(batch)
-                questions_remaining -= len(batch)
+        correct = str(data["correct_answer"]).strip().upper()
+        if correct not in {"A", "B", "C", "D"}:
+            raise ValueError(f"Invalid correct_answer: {correct}")
 
-                if questions_remaining <= 0:
-                    break
+        return {
+            "question": str(data["question"]).strip(),
+            "optionA": str(data["optionA"]).strip(),
+            "optionB": str(data["optionB"]).strip(),
+            "optionC": str(data["optionC"]).strip(),
+            "optionD": str(data["optionD"]).strip(),
+            "correct_answer": correct,
+            "difficulty": str(data.get("difficulty", difficulty)).strip().title(),
+            # Placeholders — filled in by merge_explanation()
+            "rationaleA": "",
+            "rationaleB": "",
+            "rationaleC": "",
+            "rationaleD": "",
+            "memory_trick": "",
+            "pearl": "",
+            "reference": "",
+            "topic": topic,
+        }
 
-                # Small delay between batches to respect API limits
-                if batch_num < batches_needed - 1:
-                    await asyncio.sleep(2)
+    # ── Public: generate ONE explanation ──────────────────────
 
-            except Exception as e:
-                log.error(
-                    f"Batch {batch_num + 1} failed: {e}. "
-                    f"Continuing with {len(all_questions)} questions so far."
-                )
-                if len(all_questions) == 0:
-                    raise RuntimeError(
-                        f"Failed to generate any questions. Error: {e}"
-                    )
+    async def generate_explanation(self, question: dict) -> dict:
+        """
+        Generate a detailed explanation for an already-generated question
+        via a single Gemini API call.
 
-        log.info(
-            f"Batch generation complete: {len(all_questions)} questions "
-            f"generated for topic '{topic}'"
+        Args:
+            question: The question dict (must have question, optionA-D,
+                      correct_answer, topic).
+
+        Returns:
+            Dict with keys: correct_rationale, rationale_wrong_options,
+            memory_trick, pearl, reference.
+
+        Raises:
+            RuntimeError: If generation fails after retries.
+        """
+        prompt = SINGLE_EXPLANATION_PROMPT.format(
+            question=question.get("question", ""),
+            optionA=question.get("optionA", ""),
+            optionB=question.get("optionB", ""),
+            optionC=question.get("optionC", ""),
+            optionD=question.get("optionD", ""),
+            correct_answer=question.get("correct_answer", ""),
+            topic=question.get("topic", ""),
         )
-        return all_questions
+        raw = await self._call_gemini(self._expl_model, prompt)
+        data = _extract_single_json(raw)
+
+        return {
+            "correct_rationale": str(data.get("correct_rationale", "")).strip(),
+            "rationale_wrong_options": {
+                "A": str(
+                    data.get("rationale_wrong_options", {}).get("A", "")
+                ).strip(),
+                "B": str(
+                    data.get("rationale_wrong_options", {}).get("B", "")
+                ).strip(),
+                "C": str(
+                    data.get("rationale_wrong_options", {}).get("C", "")
+                ).strip(),
+                "D": str(
+                    data.get("rationale_wrong_options", {}).get("D", "")
+                ).strip(),
+            },
+            "memory_trick": str(data.get("memory_trick", "")).strip(),
+            "pearl": str(data.get("pearl", "")).strip(),
+            "reference": str(data.get("reference", "")).strip(),
+        }
+
+    # ── Helper: merge question + explanation into one dict ───
+
+    @staticmethod
+    def merge_explanation(question: dict, explanation: dict) -> dict:
+        """
+        Merge the explanation data into the question dict.
+
+        The correct option gets correct_rationale; wrong options get
+        their individual wrong rationales.
+        """
+        correct = question.get("correct_answer", "A").upper()
+        wrong = explanation.get("rationale_wrong_options", {})
+        correct_rat = explanation.get("correct_rationale", "")
+
+        question["rationaleA"] = (
+            correct_rat if correct == "A" else wrong.get("A", "")
+        )
+        question["rationaleB"] = (
+            correct_rat if correct == "B" else wrong.get("B", "")
+        )
+        question["rationaleC"] = (
+            correct_rat if correct == "C" else wrong.get("C", "")
+        )
+        question["rationaleD"] = (
+            correct_rat if correct == "D" else wrong.get("D", "")
+        )
+        question["memory_trick"] = explanation.get("memory_trick", "")
+        question["pearl"] = explanation.get("pearl", "")
+        question["reference"] = explanation.get("reference", "")
+
+        return question
 
 
-# Module-level singleton
+# ── Module-level singleton ────────────────────────────────────
 gemini_client = GeminiClient()

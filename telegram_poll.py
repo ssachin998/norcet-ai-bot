@@ -1,13 +1,20 @@
 """
 NORCET AI Bot - Telegram Poll Module
 ======================================
-Handles creating and posting quiz polls to Telegram,
-sending solutions (hidden in spoilers), and managing Telegram rate limits.
+Interleaved question generation and posting — no preloading.
 
 Session timing (per question, 30-second cycle):
-  0s  → Send QuizPoll (open_period = 30s, auto-closes)
-  15s → Send Solution message with spoiler
-  30s → Next question begins
+  00s → Gemini: generate_single_question()  [API call #1]
+  00s → Telegram: send QuizPoll
+  15s → Gemini: generate_explanation()      [API call #2]
+  15s → Telegram: send Solution (spoiler)
+  30s → Gemini: generate_single_question()  [API call #3, next Q]
+  30s → Telegram: send QuizPoll
+  45s → Gemini: generate_explanation()      [API call #4, next Q]
+  ...
+
+Total: 60 questions × 30s = 30 minutes.
+API calls: exactly 4 per minute (never exceeding the 4/60s limit).
 """
 
 import asyncio
@@ -17,12 +24,11 @@ from typing import Optional
 
 from telegram import (
     Bot,
-    Update,
     Poll,
     InputPollOption,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, RetryAfter, TimedOut
+from telegram.error import TelegramError
 
 from config import Config
 from logger import log
@@ -34,6 +40,7 @@ from utils import (
     parse_chat_id,
     format_session_header,
     async_retry,
+    generate_difficulty_distribution,
 )
 from database import (
     store_question,
@@ -41,10 +48,9 @@ from database import (
     update_daily_stats,
     start_post_history,
     update_post_history,
-    set_topic_progress,
     get_topic_progress,
 )
-from gemini import gemini_client
+from gemini import gemini_client, GeminiRateLimiter
 from topic_manager import TopicManager
 from duplicate_checker import duplicate_checker
 from datetime import datetime, timezone, timedelta
@@ -52,28 +58,21 @@ from datetime import datetime, timezone, timedelta
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+# ── Solution Formatter ───────────────────────────────────────
+
 def format_solution(question: dict, question_number: int) -> str:
     """
-    Format the solution message for a question.
+    Format the solution message.
 
-    The ENTIRE explanation is wrapped inside a Telegram spoiler tag
-    (<span class="tg-spoiler">). Only the header and difficulty badge
-    are visible without tapping the spoiler.
+    Visible: header line + difficulty badge.
+    Hidden (inside spoiler): everything else.
 
     Inside the spoiler:
-      - Correct answer
-      - Detailed rationale
-      - Why each wrong option is incorrect
-      - Memory trick
-      - NORCET pearl
-      - Reference
-
-    Args:
-        question: Question dict with all fields.
-        question_number: The question number in the session.
-
-    Returns:
-        HTML-formatted string for Telegram message.
+      ✔ Correct Answer
+      ✔ Why correct option is correct
+      ✔ Why every wrong option is wrong
+      ✔ NORCET memory trick
+      ✔ High-yield exam point
     """
     correct = question.get("correct_answer", "A").upper()
     option_labels = ["A", "B", "C", "D"]
@@ -81,185 +80,223 @@ def format_solution(question: dict, question_number: int) -> str:
     rationale_keys = ["rationaleA", "rationaleB", "rationaleC", "rationaleD"]
     correct_idx = option_labels.index(correct)
 
-    # ── Visible header (outside spoiler) ────────────────────
     parts: list[str] = [
-        f"💡 <b>Solution Q{question_number}</b>",
-        "",  # blank line before spoiler
+        f"\U0001f4a1 <b>Solution Q{question_number}</b>",
+        "",
+        '<span class="tg-spoiler">',
     ]
 
-    # ── Start spoiler ──────────────────────────────────────
-    parts.append('<span class="tg-spoiler">')
-
-    # ✅ Correct answer
+    # ✔ Correct answer
     correct_text = question.get(option_keys[correct_idx], "")
-    parts.append(f"✅ <b>Correct Answer: {correct}.</b> {escape_html(correct_text)}")
+    parts.append(f"\u2714\ufe0f <b>Correct Answer: {correct}.</b> {escape_html(correct_text)}")
     parts.append("")
 
-    # 📖 Detailed rationale (for the correct option)
+    # ✔ Why correct
     correct_rationale = question.get(rationale_keys[correct_idx], "").strip()
     if correct_rationale:
-        parts.append("📖 <b>Detailed Rationale:</b>")
+        parts.append("\u2714\ufe0f <b>Why {correct} is correct:</b>")
         parts.append(f"<i>{escape_html(correct_rationale)}</i>")
         parts.append("")
 
-    # ❌ Why each wrong option is wrong
-    for i, (label, opt_key, rat_key) in enumerate(
-        zip(option_labels, option_keys, rationale_keys)
-    ):
+    # ✔ Why each wrong option is wrong
+    for label, opt_key, rat_key in zip(option_labels, option_keys, rationale_keys):
         if label != correct:
             rationale = question.get(rat_key, "").strip()
-            parts.append(f"❌ <b>Why Option {label} is wrong:</b>")
+            parts.append(f"\u2714\ufe0f <b>Why Option {label} is wrong:</b>")
             if rationale:
                 parts.append(f"<i>{escape_html(rationale)}</i>")
             else:
                 opt_text = question.get(opt_key, "")
-                parts.append(f"<i>{escape_html(opt_text)} is not the correct answer.</i>")
+                parts.append(f"<i>{escape_html(opt_text)} is incorrect.</i>")
             parts.append("")
 
-    # 🧠 Memory trick
+    # ✔ Memory trick / NORCET exam trick
     memory_trick = question.get("memory_trick", "").strip()
     if memory_trick:
-        parts.append("🧠 <b>Memory Trick:</b>")
+        parts.append("\u2714\ufe0f <b>NORCET Memory Trick:</b>")
         parts.append(f"<i>{escape_html(memory_trick)}</i>")
         parts.append("")
 
-    # 🎯 NORCET Pearl
+    # ✔ High-yield exam point
     pearl = question.get("pearl", "").strip()
     if pearl:
-        parts.append("🎯 <b>NORCET Pearl:</b>")
+        parts.append("\u2714\ufe0f <b>High-Yield Exam Point:</b>")
         parts.append(f"<i>{escape_html(pearl)}</i>")
         parts.append("")
 
-    # 📖 Reference
+    # Reference
     reference = question.get("reference", "").strip()
     if reference:
-        parts.append("📖 <b>Reference:</b>")
-        parts.append(f"<i>{escape_html(reference)}</i>")
+        parts.append(f"\U0001f4d6 <b>Reference:</b> <i>{escape_html(reference)}</i>")
         parts.append("")
 
-    # ── End spoiler ────────────────────────────────────────
-    parts.append('</span>')
+    parts.append("</span>")
 
-    # ── Visible footer (outside spoiler) ────────────────────
+    # Visible difficulty footer
     difficulty = question.get("difficulty", "Moderate")
-    diff_emoji = {"Easy": "🟢", "Moderate": "🟡", "Hard": "🔴"}
-    diff_emoji_str = diff_emoji.get(difficulty, "🟡")
-    parts.append(f"<b>Difficulty:</b> {diff_emoji_str} {escape_html(difficulty)}")
+    diff_emoji = {"Easy": "\U0001f7e2", "Moderate": "\U0001f7e1", "Hard": "\U0001f534"}
+    parts.append(f"<b>Difficulty:</b> {diff_emoji.get(difficulty, '\U0001f7e1')} {escape_html(difficulty)}")
 
     return truncate_text("\n".join(parts))
 
 
-async def send_quiz_poll(
+# ── Send Poll ────────────────────────────────────────────────
+
+async def _send_poll(
     bot: Bot,
     chat_id: str,
     question: dict,
     question_number: int,
-) -> Optional[tuple[int, int]]:
+) -> Optional[int]:
     """
-    Send a single quiz poll and its solution to a Telegram chat.
-
-    Timing within each question cycle:
-      0s  → Send anonymous QuizPoll (open_period = QUESTION_INTERVAL)
-      15s → Send Solution message (entire explanation inside spoiler)
-
-    The poll auto-closes after QUESTION_INTERVAL seconds, revealing
-    correct/wrong highlighting to all users.
-
-    Args:
-        bot: Telegram Bot instance.
-        chat_id: Target chat/channel ID.
-        question: Question dict.
-        question_number: Question number for display.
-
-    Returns:
-        Tuple of (poll_message_id, solution_message_id) or None on failure.
+    Send one QuizPoll to Telegram. Returns the message_id on success.
     """
     correct = question.get("correct_answer", "A").upper()
     options = [
-        InputPollOption(
-            text=sanitize_text(question.get("optionA", "")),
-            text_parse_mode=ParseMode.HTML,
-        ),
-        InputPollOption(
-            text=sanitize_text(question.get("optionB", "")),
-            text_parse_mode=ParseMode.HTML,
-        ),
-        InputPollOption(
-            text=sanitize_text(question.get("optionC", "")),
-            text_parse_mode=ParseMode.HTML,
-        ),
-        InputPollOption(
-            text=sanitize_text(question.get("optionD", "")),
-            text_parse_mode=ParseMode.HTML,
-        ),
+        InputPollOption(text=sanitize_text(question.get("optionA", "")), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=sanitize_text(question.get("optionB", "")), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=sanitize_text(question.get("optionC", "")), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=sanitize_text(question.get("optionD", "")), text_parse_mode=ParseMode.HTML),
     ]
 
-    question_text = sanitize_text(question.get("question", ""))
+    msg = await async_retry(
+        bot.send_poll,
+        chat_id=chat_id,
+        question=sanitize_text(question.get("question", "")),
+        options=options,
+        type=Poll.QUIZ,
+        correct_option_id=_option_index(correct),
+        is_anonymous=True,
+        is_closed=False,
+        open_period=Config.QUESTION_INTERVAL,
+        explanation=None,
+        explanation_parse_mode=ParseMode.HTML,
+        disable_notification=True,
+        max_retries=Config.MAX_TELEGRAM_RETRIES,
+        delay=1.0,
+        description=f"send_poll_Q{question_number}",
+    )
+    log.info(f"Poll sent (Q{question_number}): msg_id={msg.message_id}")
+    return msg.message_id
 
-    try:
-        # ── t=0: Send the quiz poll ────────────────────────
-        poll_message = await async_retry(
-            bot.send_poll,
-            chat_id=chat_id,
-            question=question_text,
-            options=options,
-            type=Poll.QUIZ,
-            correct_option_id=_option_index(correct),
-            is_anonymous=True,
-            is_closed=False,
-            open_period=Config.QUESTION_INTERVAL,
-            explanation=None,
-            explanation_parse_mode=ParseMode.HTML,
-            disable_notification=True,
-            max_retries=Config.MAX_TELEGRAM_RETRIES,
-            delay=1.0,
-            description="send_quiz_poll",
-        )
 
-        log.info(
-            f"Poll sent (Q{question_number}): msg_id={poll_message.message_id}"
-        )
+# ── Send Solution ────────────────────────────────────────────
 
-        # ── t=15s: Wait, then send solution ─────────────────
-        await asyncio.sleep(Config.SOLUTION_DELAY)
-
-        solution_text = format_solution(question, question_number)
-        solution_message = await async_retry(
-            bot.send_message,
-            chat_id=chat_id,
-            text=solution_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            disable_notification=True,
-            max_retries=Config.MAX_TELEGRAM_RETRIES,
-            delay=1.0,
-            description="send_solution",
-        )
-
-        log.info(
-            f"Solution sent (Q{question_number}): msg_id={solution_message.message_id}"
-        )
-
-        return poll_message.message_id, solution_message.message_id
-
-    except TelegramError as e:
-        log.error(
-            f"Failed to send poll Q{question_number}: "
-            f"{type(e).__name__}: {e}"
-        )
-        return None
-    except Exception as e:
-        log.error(
-            f"Unexpected error sending poll Q{question_number}: {e}"
-        )
-        return None
+async def _send_solution(
+    bot: Bot,
+    chat_id: str,
+    question: dict,
+    question_number: int,
+) -> Optional[int]:
+    """
+    Send the solution message (with spoiler) to Telegram.
+    """
+    text = format_solution(question, question_number)
+    msg = await async_retry(
+        bot.send_message,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        disable_notification=True,
+        max_retries=Config.MAX_TELEGRAM_RETRIES,
+        delay=1.0,
+        description=f"send_solution_Q{question_number}",
+    )
+    log.info(f"Solution sent (Q{question_number}): msg_id={msg.message_id}")
+    return msg.message_id
 
 
 def _option_index(letter: str) -> int:
-    """Convert option letter to index for Telegram Poll API."""
-    mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
-    return mapping.get(letter.upper(), 0)
+    return {"A": 0, "B": 1, "C": 2, "D": 3}.get(letter.upper(), 0)
 
+
+# ── Single Question Cycle ────────────────────────────────────
+
+async def _run_one_question(
+    bot: Bot,
+    chat_id: str,
+    question_number: int,
+    topic: str,
+    difficulty: str,
+    session_type: str,
+) -> Optional[dict]:
+    """
+    Execute one full 30-second question cycle.
+
+    Timeline:
+      00s → Gemini generates MCQ (API #1/#3)
+      00s → Telegram sends QuizPoll
+      15s → Gemini generates explanation (API #2/#4)
+      15s → Telegram sends Solution spoiler
+
+    Returns the merged question dict if successful, None if failed.
+    On failure the session continues to the next question — never cancels.
+    """
+    q_start = time.monotonic()
+    try:
+        # ── 00s: Generate single MCQ ───────────────────────
+        log.info(f"Q{question_number}: Generating MCQ …")
+        question = await gemini_client.generate_single_question(
+            topic=topic,
+            difficulty=difficulty,
+        )
+
+        # Duplicate check
+        if duplicate_checker.is_duplicate(question.get("question", "")):
+            log.info(f"Q{question_number}: Duplicate detected, generating replacement …")
+            question = await gemini_client.generate_single_question(
+                topic=topic,
+                difficulty=difficulty,
+            )
+
+        # Randomize option order
+        question = randomize_options(question)
+
+        # ── 00s: Send poll ─────────────────────────────────
+        poll_msg_id = await _send_poll(bot, chat_id, question, question_number)
+        if poll_msg_id is None:
+            log.error(f"Q{question_number}: Failed to send poll. Skipping to next.")
+            return None
+
+        # ── 15s: Wait until solution time ─────────────────
+        elapsed_so_far = time.monotonic() - q_start
+        time_to_solution = Config.SOLUTION_DELAY - elapsed_so_far
+        if time_to_solution > 0:
+            await asyncio.sleep(time_to_solution)
+
+        # ── 15s: Generate explanation ────────────────────────
+        log.info(f"Q{question_number}: Generating explanation …")
+        try:
+            explanation = await gemini_client.generate_explanation(question)
+            question = GeminiClient.merge_explanation(question, explanation)
+        except Exception as e:
+            log.warning(
+                f"Q{question_number}: Explanation generation failed: {e}. "
+                "Continuing without explanation."
+            )
+
+        # ── 15s: Send solution ────────────────────────────
+        sol_msg_id = await _send_solution(bot, chat_id, question, question_number)
+
+        # ── Store in database ──────────────────────────────
+        if poll_msg_id is not None:
+            q_id = store_question(question, topic, session_type)
+            if q_id and sol_msg_id is not None:
+                update_poll_message_id(q_id, poll_msg_id, sol_msg_id)
+            duplicate_checker.add_to_cache(question.get("question", ""))
+
+        return question
+
+    except Exception as e:
+        log.error(
+            f"Q{question_number}: Cycle failed: {type(e).__name__}: {e}. "
+            "Skipping to next question."
+        )
+        return None
+
+
+# ── Full Session ────────────────────────────────────────────
 
 async def run_quiz_session(
     bot: Bot,
@@ -267,35 +304,30 @@ async def run_quiz_session(
     session_type: str,
 ) -> dict:
     """
-    Run a complete quiz session for the current topic.
+    Run a complete 30-minute quiz session (60 questions).
 
-    Generates questions via Gemini, posts polls with solutions,
-    stores everything in the database, and handles topic advancement.
+    For each question:
+      1. Generate ONE MCQ via Gemini  (rate-limited, HTTP 429 retried)
+      2. Send QuizPoll to Telegram
+      3. Generate ONE explanation via Gemini  (rate-limited, HTTP 429 retried)
+      4. Send Solution spoiler to Telegram
+      5. Fill remaining time to maintain 30s cadence
 
-    Session: 60 questions × 30-second intervals = 30 minutes.
-
-    Args:
-        bot: Telegram Bot instance.
-        topic_manager: TopicManager instance.
-        session_type: "Morning" or "Evening".
-
-    Returns:
-        Dict with session results (questions_posted, topic, etc.)
+    No preloading. No batching. No caching.
     """
     topic = topic_manager.current_topic
-    questions_needed = Config.QUESTIONS_PER_SESSION
+    total_questions = Config.QUESTIONS_PER_SESSION
     chat_id = parse_chat_id(Config.QUIZ_CHAT_ID)
 
     log.info(
-        f"Starting {session_type} quiz session: topic='{topic}', "
-        f"questions={questions_needed}, chat_id={chat_id}"
+        f"Starting {session_type} session: topic='{topic}', "
+        f"questions={total_questions}, chat_id={chat_id}"
     )
 
-    # Create post history entry
     history_id = start_post_history(topic, session_type)
 
     # Send session header
-    header = format_session_header(topic, session_type, questions_needed)
+    header = format_session_header(topic, session_type, total_questions)
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -303,89 +335,50 @@ async def run_quiz_session(
             parse_mode=ParseMode.HTML,
             disable_notification=False,
         )
-        log.info(f"Session header sent for {session_type} session")
     except TelegramError as e:
         log.error(f"Failed to send session header: {e}")
 
-    # Generate questions
-    try:
-        questions = await gemini_client.generate_batch(
-            topic=topic,
-            total_count=questions_needed,
-        )
-    except Exception as e:
-        log.error(f"Failed to generate questions: {e}")
-        update_post_history(history_id, 0, "failed", str(e))
-        return {
-            "success": False,
-            "topic": topic,
-            "session_type": session_type,
-            "questions_posted": 0,
-            "error": str(e),
-        }
+    # Pre-compute difficulty distribution for the session
+    difficulties = generate_difficulty_distribution(total_questions)
 
-    if not questions:
-        log.error("No questions generated")
-        update_post_history(history_id, 0, "failed", "No questions generated")
-        return {
-            "success": False,
-            "topic": topic,
-            "session_type": session_type,
-            "questions_posted": 0,
-            "error": "No questions generated",
-        }
-
-    # Filter duplicates
-    questions = duplicate_checker.filter_duplicates(questions)
-    if not questions:
-        log.error("All generated questions were duplicates")
-        update_post_history(history_id, 0, "failed", "All questions were duplicates")
-        return {
-            "success": False,
-            "topic": topic,
-            "session_type": session_type,
-            "questions_posted": 0,
-            "error": "All questions were duplicates",
-        }
-
-    # Randomize option order for each question
-    questions = [randomize_options(q) for q in questions]
-
-    # Post polls one by one with precise 30-second intervals
+    # ── Main loop: one question per iteration ────────────────
     posted_questions: list[dict] = []
     failed_count = 0
+    diff_idx = 0  # index into difficulties list
 
-    for i, question in enumerate(questions, start=1):
+    for q_num in range(1, total_questions + 1):
+        q_cycle_start = time.monotonic()
+
+        difficulty = difficulties[diff_idx] if diff_idx < len(difficulties) else "Moderate"
+        diff_idx += 1
+
         log.info(
-            f"Posting poll {i}/{len(questions)} "
-            f"[{session_type}] - '{question.get('question', '')[:60]}...'"
+            f"[{session_type}] Q{q_num}/{total_questions} "
+            f"(difficulty={difficulty}) — cycle starting"
         )
 
-        # Track precise timing for 30-second question intervals
-        question_start = time.monotonic()
+        question = await _run_one_question(
+            bot=bot,
+            chat_id=chat_id,
+            question_number=q_num,
+            topic=topic,
+            difficulty=difficulty,
+            session_type=session_type,
+        )
 
-        result = await send_quiz_poll(bot, chat_id, question, i)
-
-        if result:
-            poll_msg_id, solution_msg_id = result
-            question_id = store_question(question, topic, session_type)
-            if question_id:
-                update_poll_message_id(question_id, poll_msg_id, solution_msg_id)
+        if question:
             posted_questions.append(question)
-            duplicate_checker.add_to_cache(question.get("question", ""))
         else:
             failed_count += 1
 
-        # Fill remaining time to maintain exact QUESTION_INTERVAL cadence
-        # (send_quiz_poll internally sleeps SOLUTION_DELAY=15s, so we
-        #  only need the remainder to reach the full 30s interval)
-        if i < len(questions):
-            elapsed = time.monotonic() - question_start
+        # ── Fill remaining time to hit 30-second cadence ────
+        if q_num < total_questions:
+            elapsed = time.monotonic() - q_cycle_start
             remaining = Config.QUESTION_INTERVAL - elapsed
             if remaining > 0:
                 await asyncio.sleep(remaining)
 
-    # Update stats
+    # ── Session wrap-up ────────────────────────────────────
     posted_count = len(posted_questions)
     date_str = datetime.now(IST).strftime("%Y-%m-%d")
 
@@ -393,24 +386,20 @@ async def run_quiz_session(
     update_daily_stats(date_str, session_type, posted_questions)
     topic_manager.increment_questions_asked(posted_count)
 
-    # Check if we should advance to next topic
+    # Topic advancement
     progress = get_topic_progress()
     questions_asked = progress.get("questions_asked", 0) + posted_count
-
-    # Auto-advance after 100 questions per topic (configurable logic)
     QUESTIONS_PER_TOPIC = 100
     if questions_asked >= QUESTIONS_PER_TOPIC:
         log.info(
-            f"Topic '{topic}' has reached {questions_asked} questions. "
-            "Advancing to next topic."
+            f"Topic '{topic}' reached {questions_asked} questions. Advancing."
         )
         new_topic = topic_manager.advance_to_next_topic()
-        # Send topic completion message
         try:
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"<b>🎉 Topic Complete!</b>\n\n"
+                    f"<b>\U0001f389 Topic Complete!</b>\n\n"
                     f"Finished: <i>{escape_html(topic)}</i>\n"
                     f"Questions covered: {questions_asked}\n\n"
                     f"<b>Next Topic:</b> <i>{escape_html(new_topic)}</i>"
@@ -421,10 +410,10 @@ async def run_quiz_session(
         except TelegramError as e:
             log.error(f"Failed to send topic completion message: {e}")
 
-    # Send session summary
+    # Session summary
     try:
         summary = (
-            f"<b>📋 Session Summary — {session_type}</b>\n"
+            f"<b>\U0001f4cb Session Summary — {session_type}</b>\n"
             f"Topic: <i>{escape_html(topic)}</i>\n"
             f"Questions posted: <b>{posted_count}</b>\n"
             f"Failed: {failed_count}\n"
@@ -440,7 +429,7 @@ async def run_quiz_session(
         log.error(f"Failed to send session summary: {e}")
 
     log.info(
-        f"{session_type} session complete: {posted_count} questions posted, "
+        f"{session_type} session complete: {posted_count} posted, "
         f"{failed_count} failed"
     )
 
@@ -454,17 +443,7 @@ async def run_quiz_session(
 
 
 async def post_immediate_session(bot: Bot, topic_manager: TopicManager) -> dict:
-    """
-    Trigger an immediate quiz session (bypassing the scheduler).
-    Used by the /postnow admin command.
-
-    Args:
-        bot: Telegram Bot instance.
-        topic_manager: TopicManager instance.
-
-    Returns:
-        Session result dict.
-    """
+    """Trigger an immediate quiz session (used by /postnow)."""
     now = datetime.now(IST)
     session_type = "Morning" if now.hour < 12 else "Evening"
     return await run_quiz_session(bot, topic_manager, session_type)
