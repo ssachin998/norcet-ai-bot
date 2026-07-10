@@ -1,0 +1,53 @@
+# NORCET Topic List
+# One topic per line. Lines starting with # are comments.
+# The bot will automatically cycle through these topics.
+
+Anatomy and Physiology
+Biochemistry
+Microbiology
+Pathology
+Pharmacology
+Community Health Nursing
+Medical Surgical Nursing - Cardiovascular System
+Medical Surgical Nursing - Respiratory System
+Medical Surgical Nursing - Nervous System
+Medical Surgical Nursing - Gastrointestinal System
+Medical Surgical Nursing - Renal and Urinary System
+Medical Surgical Nursing - Endocrine System
+Medical Surgical Nursing - Musculoskeletal System
+Medical Surgical Nursing - Integumentary System
+Medical Surgical Nursing - Hematological System
+Medical Surgical Nursing - Sensory System (Eye and ENT)
+Oncology Nursing
+Pediatric Nursing
+Obstetric and Gynecological Nursing
+Mental Health and Psychiatric Nursing
+Nursing Foundation and Fundamentals
+Nutrition and Dietetics
+Sociology
+Psychology
+Nursing Research and Statistics
+Nursing Management and Administration
+Nursing Education
+Community Health Nursing - Epidemiology
+Community Health Nursing - National Health Programs
+Emergency and Disaster Nursing
+Critical Care Nursing
+Geriatric Nursing
+Ethics and Legal Aspects of Nursing
+Computer Applications in Nursing
+Health Economics
+Environmental Health
+Communication and Counselling
+Nursing Informatics
+Reproductive and Child Health
+Immunization and Vaccine Preventable Diseases
+Infection Control and Prevention
+Mental Health Act and Legal Provisions
+Telemedicine and e-Health
+Nursing Theories and Models
+Evidence Based Nursing Practice
+Patient Safety and Quality Improvement
+Palliative and Terminal Care Nursing
+Rehabilitation Nursing
+Transcultural Nursing
