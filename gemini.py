@@ -278,7 +278,7 @@ class GeminiClient:
     # ── Core: call Gemini with rate-limit + 429 handling ─────
 
     async def _call_gemini(
-        self, model: genai.GenerativeModel, prompt: str
+        self, model_kind: str, prompt: str
     ) -> str:
         """
         Low-level: rate-limited Gemini call with HTTP 429 handling.
@@ -293,6 +293,14 @@ class GeminiClient:
         Raises RuntimeError after exhausting retries.
         """
         self._initialize()
+
+        # Select the model AFTER initialization so it's never None.
+        model = self._mcq_model if model_kind == "mcq" else self._expl_model
+        if model is None:
+            raise RuntimeError(
+                f"Gemini model '{model_kind}' is still None after "
+                f"_initialize() — check GEMINI_API_KEY / GEMINI_MODEL config."
+            )
 
         last_error: Exception | None = None
 
@@ -380,7 +388,7 @@ class GeminiClient:
             RuntimeError: If generation fails after retries.
         """
         prompt = SINGLE_MCQ_PROMPT.format(topic=topic, difficulty=difficulty)
-        raw = await self._call_gemini(self._mcq_model, prompt)
+        raw = await self._call_gemini("mcq", prompt)
         data = _extract_single_json(raw)
 
         # Validate
@@ -439,7 +447,7 @@ class GeminiClient:
             correct_answer=question.get("correct_answer", ""),
             topic=question.get("topic", ""),
         )
-        raw = await self._call_gemini(self._expl_model, prompt)
+        raw = await self._call_gemini("expl", prompt)
         data = _extract_single_json(raw)
 
         return {
