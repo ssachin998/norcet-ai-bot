@@ -37,7 +37,7 @@ class Config:
 
     # ── Google Gemini ─────────────────────────────────────────
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
     # ── Scheduler ────────────────────────────────────────────
     TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
