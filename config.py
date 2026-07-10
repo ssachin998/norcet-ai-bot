@@ -37,7 +37,7 @@ class Config:
 
     # ── Google Gemini ─────────────────────────────────────────
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
 
     # ── Scheduler ────────────────────────────────────────────
     TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -45,8 +45,10 @@ class Config:
     MORNING_MINUTE: int = int(os.getenv("MORNING_MINUTE", "0"))
     EVENING_HOUR: int = int(os.getenv("EVENING_HOUR", "19"))
     EVENING_MINUTE: int = int(os.getenv("EVENING_MINUTE", "0"))
-    QUESTIONS_PER_SESSION: int = int(os.getenv("QUESTIONS_PER_SESSION", "50"))
-    POLL_OPEN_DURATION: int = int(os.getenv("POLL_OPEN_DURATION", "120"))  # seconds
+    QUESTIONS_PER_SESSION: int = int(os.getenv("QUESTIONS_PER_SESSION", "60"))
+    POLL_OPEN_DURATION: int = int(os.getenv("POLL_OPEN_DURATION", "30"))  # seconds
+    SOLUTION_DELAY: int = int(os.getenv("SOLUTION_DELAY", "15"))  # seconds after poll to send solution
+    QUESTION_INTERVAL: int = int(os.getenv("QUESTION_INTERVAL", "30"))  # seconds between questions
 
     # ── Channels ────────────────────────────────────────────
     CHANNEL_ID: str = os.getenv("CHANNEL_ID", "")  # e.g. "@norcet_quiz" or "-100123456"
@@ -63,6 +65,8 @@ class Config:
     GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
     GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     GEMINI_RETRY_DELAY: int = int(os.getenv("GEMINI_RETRY_DELAY", "5"))  # seconds
+    GEMINI_RATE_LIMIT_MAX: int = int(os.getenv("GEMINI_RATE_LIMIT_MAX", "4"))  # max requests per rolling window
+    GEMINI_RATE_LIMIT_WINDOW: int = int(os.getenv("GEMINI_RATE_LIMIT_WINDOW", "60"))  # rolling window in seconds
 
     # ── Telegram Rate Limits ─────────────────────────────────
     TELEGRAM_RATE_LIMIT: float = float(os.getenv("TELEGRAM_RATE_LIMIT", "0.7"))

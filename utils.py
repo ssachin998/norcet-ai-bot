@@ -93,6 +93,7 @@ def randomize_options(question: dict[str, Any]) -> dict[str, Any]:
         "rationaleD": options[3]["rationale"],
         "correct_answer": new_correct,
         "pearl": question.get("pearl", ""),
+        "memory_trick": question.get("memory_trick", ""),
         "reference": question.get("reference", ""),
         "difficulty": question.get("difficulty", "Moderate"),
     }
@@ -192,6 +193,8 @@ def format_session_header(topic: str, session_type: str, count: int) -> str:
         f"<b>NORCET Daily Quiz — {session_type} Session</b>\n"
         f"<b>Topic:</b> <i>{escape_html(topic)}</i>\n"
         f"<b>Questions:</b> {count} MCQs\n"
-        f"<b>Poll Duration:</b> 120 seconds each\n\n"
-        f"<i>Answer the polls below. Detailed explanations will follow each poll.</i>"
+        f"<b>Session Duration:</b> ~30 minutes\n"
+        f"<b>Question Interval:</b> 30 seconds\n"
+        f"<b>Solution:</b> Revealed after each poll (tap spoiler to view)\n\n"
+        f"<i>Answer the polls below. Tap the spoiler to reveal detailed explanations.</i>"
     )

@@ -16,12 +16,71 @@ import json
 import asyncio
 import time
 from typing import Optional
+from collections import deque
 
 import google.generativeai as genai
 
 from config import Config
 from logger import log
 from database import get_all_question_hashes, generate_question_hash
+
+
+# ── Gemini Rate Limiter ─────────────────────────────────────
+
+class GeminiRateLimiter:
+    """
+    Token-bucket style rate limiter enforcing a maximum number of
+    Gemini API requests within a rolling time window.
+
+    Guarantee: NEVER more than GEMINI_RATE_LIMIT_MAX requests
+    in any rolling GEMINI_RATE_LIMIT_WINDOW-second window.
+    If a request would exceed the limit, it blocks until a slot opens.
+    """
+
+    def __init__(self, max_requests: int = 4, window_seconds: int = 60) -> None:
+        self._max = max_requests
+        self._window = window_seconds
+        self._timestamps: deque[float] = deque()
+
+    async def acquire(self) -> None:
+        """
+        Block until a request slot is available.
+
+        Prunes stale timestamps, checks capacity, and sleeps
+        the exact remaining time if the window is full.
+        """
+        while True:
+            now = time.monotonic()
+            # Prune timestamps outside the rolling window
+            while self._timestamps and (now - self._timestamps[0]) >= self._window:
+                self._timestamps.popleft()
+
+            if len(self._timestamps) < self._max:
+                self._timestamps.append(time.monotonic())
+                return
+
+            # Window is full — calculate exact wait until oldest slot frees
+            wait = self._window - (now - self._timestamps[0]) + 0.1
+            log.info(
+                f"Gemini rate limit reached ({self._max}/{self._window}s). "
+                f"Waiting {wait:.1f}s for next slot..."
+            )
+            await asyncio.sleep(wait)
+
+    @property
+    def available_slots(self) -> int:
+        """How many requests can be made right now without waiting."""
+        now = time.monotonic()
+        while self._timestamps and (now - self._timestamps[0]) >= self._window:
+            self._timestamps.popleft()
+        return self._max - len(self._timestamps)
+
+
+# Module-level rate limiter instance
+gemini_rate_limiter = GeminiRateLimiter(
+    max_requests=Config.GEMINI_RATE_LIMIT_MAX,
+    window_seconds=Config.GEMINI_RATE_LIMIT_WINDOW,
+)
 
 
 # ── Gemini Prompt Templates ────────────────────────────────────
@@ -71,6 +130,7 @@ IMPORTANT REQUIREMENTS:
    - "rationaleC": Detailed explanation of why option C is correct or incorrect
    - "rationaleD": Detailed explanation of why option D is correct or incorrect
    - "pearl": A high-yield NORCET pearl/tip related to this question concept
+   - "memory_trick": A mnemonic or memory aid to help remember the answer
    - "reference": Genuine textbook reference with edition and page if possible
      (Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC)
    - "difficulty": "Easy", "Moderate", or "Hard"
@@ -98,6 +158,7 @@ Example format:
     "rationaleC": "...",
     "rationaleD": "...",
     "pearl": "...",
+    "memory_trick": "...",
     "reference": "Robbins Basic Pathology, 10th Edition, Chapter 5",
     "difficulty": "Moderate"
   }}
@@ -116,6 +177,7 @@ class GeminiClient:
     def __init__(self) -> None:
         self._model: Optional[genai.GenerativeModel] = None
         self._initialized: bool = False
+        self._rate_limiter: GeminiRateLimiter = gemini_rate_limiter
 
     def _initialize(self) -> None:
         """Initialize the Gemini API client. Called lazily."""
@@ -217,6 +279,9 @@ class GeminiClient:
                     f"Generating {count} questions for topic '{topic}' "
                     f"(attempt {attempt}/{Config.GEMINI_MAX_RETRIES})"
                 )
+
+                # Wait for rate limiter before making the API call
+                await self._rate_limiter.acquire()
 
                 # Run synchronous Gemini call in executor to avoid blocking
                 loop = asyncio.get_event_loop()
@@ -339,7 +404,7 @@ class GeminiClient:
         required_fields = {
             "question", "optionA", "optionB", "optionC", "optionD",
             "correct_answer", "rationaleA", "rationaleB", "rationaleC",
-            "rationaleD", "pearl", "reference", "difficulty",
+            "rationaleD", "pearl", "memory_trick", "reference", "difficulty",
         }
 
         valid_options = {"A", "B", "C", "D"}
@@ -398,6 +463,7 @@ class GeminiClient:
                 "rationaleC": str(q["rationaleC"]).strip(),
                 "rationaleD": str(q["rationaleD"]).strip(),
                 "pearl": str(q["pearl"]).strip(),
+                "memory_trick": str(q.get("memory_trick", "")).strip(),
                 "reference": str(q["reference"]).strip(),
                 "difficulty": difficulty,
                 "topic": topic,
