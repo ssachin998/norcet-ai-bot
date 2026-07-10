@@ -183,6 +183,47 @@ Return ONLY the JSON object. No markdown, no explanation, no code fences.
 """
 
 
+BATCH_MCQ_PROMPT = """
+Generate exactly {count} NORCET-level Multiple Choice Questions on the topic: "{topic}"
+
+Assign each question one of these difficulty levels, IN THIS EXACT ORDER
+(question 1 gets the 1st difficulty listed, question 2 the 2nd, etc.):
+{difficulties}
+
+Return a JSON array (a list) of exactly {count} objects — NOT wrapped in any
+other object. Each object must have EXACTLY these fields:
+{{
+  "question": "The question text",
+  "optionA": "First option",
+  "optionB": "Second option",
+  "optionC": "Third option",
+  "optionD": "Fourth option",
+  "correct_answer": "The correct option letter — exactly A, B, C, or D",
+  "difficulty": "Easy | Moderate | Hard",
+  "correct_rationale": "Detailed explanation of why the correct answer is correct. Include pathophysiology, pharmacology, or clinical reasoning. 2-4 sentences.",
+  "rationale_wrong_options": {{
+    "A": "Why option A is wrong (2-3 sentences)",
+    "B": "Why option B is wrong (2-3 sentences)",
+    "C": "Why option C is wrong (2-3 sentences)",
+    "D": "Why option D is wrong (2-3 sentences)"
+  }},
+  "memory_trick": "A mnemonic or memory aid to remember the answer. Keep it short and catchy.",
+  "pearl": "A high-yield NORCET exam point related to this question concept.",
+  "reference": "Genuine textbook reference. Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC."
+}}
+
+Requirements:
+- Every question must test clinical application, not mere recall.
+- All four options must be plausible.
+- The correct answer must be unambiguously correct.
+- Each rationale must explain WHY with clinical reasoning.
+- The reference must be a REAL textbook citation.
+- No two questions in this batch may repeat the same question pattern.
+
+Return ONLY the JSON array of {count} objects. No markdown, no explanation, no code fences.
+"""
+
+
 # ── Helper: parse a single JSON object from free-form text ──
 
 def _extract_single_json(raw_text: str) -> dict:
@@ -220,6 +261,47 @@ def _extract_single_json(raw_text: str) -> dict:
 
     raise ValueError(
         f"Cannot extract JSON object from Gemini response. "
+        f"Response starts with: {text[:200]}"
+    )
+
+
+def _extract_json_array(raw_text: str) -> list:
+    """
+    Extract a JSON array from Gemini response text.
+    Handles markdown fences, surrounding text, and raw JSON.
+    """
+    text = raw_text.strip()
+
+    # Strip markdown code fences
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+
+    # Try direct parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Extract first [ … ] block
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    raise ValueError(
+        f"Cannot extract JSON array from Gemini response. "
         f"Response starts with: {text[:200]}"
     )
 
@@ -470,6 +552,95 @@ class GeminiClient:
             "pearl": str(data.get("pearl", "")).strip(),
             "reference": str(data.get("reference", "")).strip(),
         }
+
+    # ── Public: generate a BATCH of questions (question+explanation) ──
+
+    async def generate_question_batch(
+        self,
+        topic: str,
+        difficulties: list[str],
+    ) -> list[dict]:
+        """
+        Generate `len(difficulties)` fully-merged questions (MCQ +
+        explanation together) via a SINGLE Gemini API call.
+
+        This is the low-quota-usage path: instead of 2 API calls per
+        question (1 for MCQ, 1 for explanation), this uses exactly
+        1 API call for the whole batch — e.g. 10 questions in 1 call
+        instead of 20 calls.
+
+        Args:
+            topic: The NORCET topic.
+            difficulties: List of difficulty strings, one per question,
+                          in the order they should be assigned.
+
+        Returns:
+            List of question dicts, each already merged with its
+            explanation (question, optionA-D, correct_answer,
+            difficulty, rationaleA-D, memory_trick, pearl, reference,
+            topic). Items that fail validation are skipped (not raised),
+            so the returned list may be shorter than `difficulties`
+            if the model returns a malformed item.
+
+        Raises:
+            RuntimeError: If the whole batch call fails after retries.
+            ValueError: If the response can't be parsed as a JSON array.
+        """
+        count = len(difficulties)
+        prompt = BATCH_MCQ_PROMPT.format(
+            topic=topic,
+            count=count,
+            difficulties=", ".join(difficulties),
+        )
+        raw = await self._call_gemini("mcq", prompt)
+        raw_items = _extract_json_array(raw)
+
+        required = {
+            "question", "optionA", "optionB", "optionC", "optionD",
+            "correct_answer", "correct_rationale",
+        }
+
+        questions: list[dict] = []
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                log.warning(f"Batch item {idx}: not a JSON object, skipping")
+                continue
+
+            missing = required - set(item.keys())
+            if missing:
+                log.warning(f"Batch item {idx}: missing fields {missing}, skipping")
+                continue
+
+            correct = str(item["correct_answer"]).strip().upper()
+            if correct not in {"A", "B", "C", "D"}:
+                log.warning(f"Batch item {idx}: invalid correct_answer '{correct}', skipping")
+                continue
+
+            wrong = item.get("rationale_wrong_options", {}) or {}
+            correct_rat = str(item.get("correct_rationale", "")).strip()
+
+            fallback_difficulty = difficulties[idx] if idx < len(difficulties) else "Moderate"
+
+            questions.append({
+                "question": str(item["question"]).strip(),
+                "optionA": str(item["optionA"]).strip(),
+                "optionB": str(item["optionB"]).strip(),
+                "optionC": str(item["optionC"]).strip(),
+                "optionD": str(item["optionD"]).strip(),
+                "correct_answer": correct,
+                "difficulty": str(item.get("difficulty", fallback_difficulty)).strip().title(),
+                "topic": topic,
+                "rationaleA": correct_rat if correct == "A" else str(wrong.get("A", "")).strip(),
+                "rationaleB": correct_rat if correct == "B" else str(wrong.get("B", "")).strip(),
+                "rationaleC": correct_rat if correct == "C" else str(wrong.get("C", "")).strip(),
+                "rationaleD": correct_rat if correct == "D" else str(wrong.get("D", "")).strip(),
+                "memory_trick": str(item.get("memory_trick", "")).strip(),
+                "pearl": str(item.get("pearl", "")).strip(),
+                "reference": str(item.get("reference", "")).strip(),
+            })
+
+        log.info(f"Batch generated: {len(questions)}/{count} valid questions")
+        return questions
 
     # ── Helper: merge question + explanation into one dict ───
 

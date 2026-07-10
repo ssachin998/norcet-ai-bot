@@ -1,20 +1,24 @@
 """
 NORCET AI Bot - Telegram Poll Module
 ======================================
-Interleaved question generation and posting — no preloading.
+Batched question generation, interleaved posting.
 
-Session timing (per question, 30-second cycle):
-  00s → Gemini: generate_single_question()  [API call #1]
-  00s → Telegram: send QuizPoll
-  15s → Gemini: generate_explanation()      [API call #2]
-  15s → Telegram: send Solution (spoiler)
-  30s → Gemini: generate_single_question()  [API call #3, next Q]
-  30s → Telegram: send QuizPoll
-  45s → Gemini: generate_explanation()      [API call #4, next Q]
-  ...
+Session timing:
+  Every Config.BATCH_SIZE questions (default 10), ONE Gemini call
+  fetches a whole batch of fully-merged question+explanation dicts.
+  Posting to Telegram still happens on the normal 30s cadence per
+  question — only the *generation* is batched, not the posting.
 
-Total: 60 questions × 30s = 30 minutes.
-API calls: exactly 4 per minute (never exceeding the 4/60s limit).
+  Example with BATCH_SIZE=10, 60 questions/session:
+    1 batch call  → 10 questions ready
+    → post Q1 (poll @0s, solution @15s)
+    → post Q2 (poll @30s, solution @45s)
+    ... (all 10 posted from the cached batch, 0 extra API calls)
+    1 batch call  → next 10 questions ready
+    ... repeat
+
+Total API calls per session: 60 / BATCH_SIZE = 6 (with BATCH_SIZE=10),
+instead of 120 (2 calls × 60 questions) with the old per-question flow.
 """
 
 import asyncio
@@ -211,44 +215,37 @@ def _option_index(letter: str) -> int:
     return {"A": 0, "B": 1, "C": 2, "D": 3}.get(letter.upper(), 0)
 
 
-# ── Single Question Cycle ────────────────────────────────────
+# ── Single Question Post (no generation — question already in hand) ──
 
-async def _run_one_question(
+async def _post_one_question(
     bot: Bot,
     chat_id: str,
+    question: dict,
     question_number: int,
-    topic: str,
-    difficulty: str,
     session_type: str,
+    topic: str,
 ) -> Optional[dict]:
     """
-    Execute one full 30-second question cycle.
+    Post ONE already-generated (question+explanation merged) dict to
+    Telegram, on the normal 30-second cadence.
+
+    Unlike the old _run_one_question, this makes NO Gemini API calls —
+    the question dict was already produced by a batch call earlier.
 
     Timeline:
-      00s → Gemini generates MCQ (API #1/#3)
       00s → Telegram sends QuizPoll
-      15s → Gemini generates explanation (API #2/#4)
       15s → Telegram sends Solution spoiler
 
-    Returns the merged question dict if successful, None if failed.
+    Returns the question dict if successful, None if failed.
     On failure the session continues to the next question — never cancels.
     """
     q_start = time.monotonic()
     try:
-        # ── 00s: Generate single MCQ ───────────────────────
-        log.info(f"Q{question_number}: Generating MCQ …")
-        question = await gemini_client.generate_single_question(
-            topic=topic,
-            difficulty=difficulty,
-        )
-
-        # Duplicate check
+        # Duplicate check — if it's a dup, just skip it (no regeneration,
+        # to avoid burning an extra API call outside the batch).
         if duplicate_checker.is_duplicate(question.get("question", "")):
-            log.info(f"Q{question_number}: Duplicate detected, generating replacement …")
-            question = await gemini_client.generate_single_question(
-                topic=topic,
-                difficulty=difficulty,
-            )
+            log.info(f"Q{question_number}: Duplicate detected, skipping (no regen).")
+            return None
 
         # Randomize option order
         question = randomize_options(question)
@@ -265,17 +262,6 @@ async def _run_one_question(
         if time_to_solution > 0:
             await asyncio.sleep(time_to_solution)
 
-        # ── 15s: Generate explanation ────────────────────────
-        log.info(f"Q{question_number}: Generating explanation …")
-        try:
-            explanation = await gemini_client.generate_explanation(question)
-            question = GeminiClient.merge_explanation(question, explanation)
-        except Exception as e:
-            log.warning(
-                f"Q{question_number}: Explanation generation failed: {e}. "
-                "Continuing without explanation."
-            )
-
         # ── 15s: Send solution ────────────────────────────
         sol_msg_id = await _send_solution(bot, chat_id, question, question_number)
 
@@ -290,7 +276,7 @@ async def _run_one_question(
 
     except Exception as e:
         log.error(
-            f"Q{question_number}: Cycle failed: {type(e).__name__}: {e}. "
+            f"Q{question_number}: Post cycle failed: {type(e).__name__}: {e}. "
             "Skipping to next question."
         )
         return None
@@ -341,42 +327,67 @@ async def run_quiz_session(
     # Pre-compute difficulty distribution for the session
     difficulties = generate_difficulty_distribution(total_questions)
 
-    # ── Main loop: one question per iteration ────────────────
+    # ── Main loop: fetch in batches, post one-by-one on cadence ──
     posted_questions: list[dict] = []
     failed_count = 0
-    diff_idx = 0  # index into difficulties list
+    batch_size = max(1, Config.BATCH_SIZE)
 
-    for q_num in range(1, total_questions + 1):
-        q_cycle_start = time.monotonic()
-
-        difficulty = difficulties[diff_idx] if diff_idx < len(difficulties) else "Moderate"
-        diff_idx += 1
+    for batch_start in range(0, total_questions, batch_size):
+        batch_end = min(batch_start + batch_size, total_questions)
+        batch_difficulties = difficulties[batch_start:batch_end]
 
         log.info(
-            f"[{session_type}] Q{q_num}/{total_questions} "
-            f"(difficulty={difficulty}) — cycle starting"
+            f"[{session_type}] Fetching batch: questions "
+            f"{batch_start + 1}-{batch_end} ({len(batch_difficulties)} q) "
+            f"— 1 Gemini call"
         )
+        try:
+            batch_questions = await gemini_client.generate_question_batch(
+                topic=topic,
+                difficulties=batch_difficulties,
+            )
+        except Exception as e:
+            log.error(
+                f"[{session_type}] Batch fetch failed for questions "
+                f"{batch_start + 1}-{batch_end}: {type(e).__name__}: {e}. "
+                "Skipping this batch."
+            )
+            failed_count += len(batch_difficulties)
+            continue
 
-        question = await _run_one_question(
-            bot=bot,
-            chat_id=chat_id,
-            question_number=q_num,
-            topic=topic,
-            difficulty=difficulty,
-            session_type=session_type,
-        )
+        if len(batch_questions) < len(batch_difficulties):
+            failed_count += len(batch_difficulties) - len(batch_questions)
 
-        if question:
-            posted_questions.append(question)
-        else:
-            failed_count += 1
+        for i, question in enumerate(batch_questions):
+            q_num = batch_start + i + 1
+            q_cycle_start = time.monotonic()
 
-        # ── Fill remaining time to hit 30-second cadence ────
-        if q_num < total_questions:
-            elapsed = time.monotonic() - q_cycle_start
-            remaining = Config.QUESTION_INTERVAL - elapsed
-            if remaining > 0:
-                await asyncio.sleep(remaining)
+            log.info(
+                f"[{session_type}] Q{q_num}/{total_questions} "
+                f"(difficulty={question.get('difficulty', '?')}) — posting"
+            )
+
+            posted = await _post_one_question(
+                bot=bot,
+                chat_id=chat_id,
+                question=question,
+                question_number=q_num,
+                session_type=session_type,
+                topic=topic,
+            )
+
+            if posted:
+                posted_questions.append(posted)
+            else:
+                failed_count += 1
+
+            # ── Fill remaining time to hit 30-second cadence ────
+            is_last_overall = (batch_start + i + 1) >= total_questions
+            if not is_last_overall:
+                elapsed = time.monotonic() - q_cycle_start
+                remaining = Config.QUESTION_INTERVAL - elapsed
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
 
     # ── Session wrap-up ────────────────────────────────────
     posted_count = len(posted_questions)
