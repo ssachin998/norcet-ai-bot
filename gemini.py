@@ -403,6 +403,19 @@ class GeminiClient:
 
                 # ── Handle HTTP 429 (Rate Limit) ───────────
                 if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str or "quota" in exc_str.lower():
+                    # Daily quota exhaustion won't recover within this
+                    # session (resets at a fixed time, not a short delay).
+                    # Fail fast instead of sleeping — let the session move
+                    # on / end gracefully rather than hanging for hours.
+                    if "perday" in exc_str.lower().replace(" ", "").replace("_", ""):
+                        log.error(
+                            f"Gemini daily quota exhausted (attempt {attempt}). "
+                            "Not retrying — will resume next scheduled session."
+                        )
+                        raise RuntimeError(
+                            f"Gemini daily quota exhausted: {exc_str[:200]}"
+                        ) from exc
+
                     # Try to parse Google's retry_delay hint
                     retry_delay = Config.GEMINI_RETRY_DELAY
                     try:
@@ -423,6 +436,20 @@ class GeminiClient:
                                 retry_delay = float(m.group(1))
                     except Exception:
                         pass
+
+                    # Safety cap: never sleep more than 60s for a per-minute
+                    # rate limit. A larger hint usually signals a longer-term
+                    # quota issue we can't wait out inside one session.
+                    MAX_RETRY_SLEEP = 60.0
+                    if retry_delay > MAX_RETRY_SLEEP:
+                        log.warning(
+                            f"Gemini retry_delay hint ({retry_delay}s) exceeds "
+                            f"cap — treating as unrecoverable within this session."
+                        )
+                        raise RuntimeError(
+                            f"Gemini quota/rate-limit requires a {retry_delay}s "
+                            "wait — too long to retry within this session."
+                        ) from exc
 
                     log.warning(
                         f"Gemini 429 Rate Limit (attempt {attempt}). "

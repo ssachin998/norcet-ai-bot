@@ -2,13 +2,14 @@
 NORCET AI Bot - Duplicate Checker Module
 ======================================
 Handles detection and management of duplicate questions
-using content hashing and fuzzy matching.
+using content hashing.
 
-Uses SHA-256 hashing of normalized question text for exact deduplication.
+IMPORTANT: This module reuses database.generate_question_hash() for
+ALL hashing — the in-memory cache and the database MUST use the exact
+same normalization, or cache lookups will silently never hit (every
+check falls through to a DB query, defeating the point of the cache).
 """
 
-import hashlib
-import re
 from typing import Optional
 
 from logger import log
@@ -23,8 +24,9 @@ class DuplicateChecker:
     """
     Checks questions for duplicates before posting.
 
-    Uses normalized text hashing for fast exact matching.
-    Maintains an in-memory cache of hashes for batch operations.
+    Uses database.generate_question_hash() (SHA-256 of normalized text)
+    for both the in-memory cache and the DB fallback, so they always agree.
+    Maintains an in-memory cache of hashes for fast batch operations.
     """
 
     def __init__(self) -> None:
@@ -43,20 +45,6 @@ class DuplicateChecker:
                 self._hash_cache = set()
                 self._cache_loaded = True
 
-    def _normalize(self, text: str) -> str:
-        """
-        Normalize question text for hashing.
-        Removes extra whitespace, punctuation variations, and case differences.
-        """
-        text = text.lower().strip()
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove common punctuation that doesn't affect meaning
-        text = re.sub(r'[?.,;!]', '', text)
-        # Remove articles at the beginning
-        text = re.sub(r'^(the|a|an)\s+', '', text)
-        return text.strip()
-
     def is_duplicate(self, question_text: str) -> bool:
         """
         Check if a question is a duplicate.
@@ -69,18 +57,16 @@ class DuplicateChecker:
         Returns:
             True if the question already exists.
         """
-        normalized = self._normalize(question_text)
-        question_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        question_hash = generate_question_hash(question_text)
 
-        # Check in-memory cache first
+        # Check in-memory cache first (now uses the SAME hash as the DB)
         self._ensure_cache()
         if question_hash in self._hash_cache:  # type: ignore
             return True
 
-        # Fallback to database check
+        # Fallback to database check (covers cache staleness across restarts)
         try:
             if is_duplicate(question_text):
-                # Update cache
                 self._hash_cache.add(question_hash)  # type: ignore
                 return True
         except Exception as e:
@@ -95,8 +81,7 @@ class DuplicateChecker:
         Args:
             question_text: The question text that was stored.
         """
-        normalized = self._normalize(question_text)
-        question_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        question_hash = generate_question_hash(question_text)
         self._ensure_cache()
         self._hash_cache.add(question_hash)  # type: ignore
 

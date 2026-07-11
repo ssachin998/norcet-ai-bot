@@ -71,9 +71,20 @@ def init_database() -> None:
                 session_type TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 poll_message_id INTEGER,
-                explanation_message_id INTEGER
+                explanation_message_id INTEGER,
+                poll_closed INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+        # Migration: add poll_closed to pre-existing databases that were
+        # created before this column existed.
+        cursor.execute("PRAGMA table_info(questions)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "poll_closed" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE questions ADD COLUMN poll_closed INTEGER NOT NULL DEFAULT 0"
+            )
+            log.info("Migrated questions table: added poll_closed column")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS topic_progress (
@@ -221,6 +232,44 @@ def store_question(question: dict, topic: str, session_type: str) -> Optional[in
         except sqlite3.IntegrityError:
             log.warning(f"Duplicate question skipped: {question['question'][:50]}...")
             return None
+
+
+def get_open_poll_ids() -> list[tuple[int, int]]:
+    """
+    Get all (question_id, poll_message_id) pairs for polls that haven't
+    been closed yet. Used by the daily job that closes all of today's
+    polls at end-of-day.
+
+    Returns:
+        List of (question_id, poll_message_id) tuples.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, poll_message_id FROM questions
+            WHERE poll_closed = 0 AND poll_message_id IS NOT NULL
+        """)
+        return [(row["id"], row["poll_message_id"]) for row in cursor.fetchall()]
+
+
+def mark_polls_closed(question_ids: list[int]) -> None:
+    """
+    Mark a batch of questions' polls as closed, so they're not
+    re-processed by future daily-close runs.
+
+    Args:
+        question_ids: List of question IDs whose polls were closed.
+    """
+    if not question_ids:
+        return
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany(
+            "UPDATE questions SET poll_closed = 1 WHERE id = ?",
+            [(qid,) for qid in question_ids],
+        )
+        conn.commit()
+        log.info(f"Marked {len(question_ids)} polls as closed")
 
 
 def update_poll_message_id(question_id: int, poll_message_id: int, explanation_message_id: int) -> None:

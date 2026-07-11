@@ -93,7 +93,6 @@ def randomize_options(question: dict[str, Any]) -> dict[str, Any]:
         "rationaleD": options[3]["rationale"],
         "correct_answer": new_correct,
         "pearl": question.get("pearl", ""),
-        "memory_trick": question.get("memory_trick", ""),
         "reference": question.get("reference", ""),
         "difficulty": question.get("difficulty", "Moderate"),
     }
@@ -189,12 +188,12 @@ def format_session_header(topic: str, session_type: str, count: int) -> str:
         session_type: "Morning" or "Evening".
         count: Number of questions in this session.
     """
+    from config import Config
+
     return (
         f"<b>NORCET Daily Quiz — {session_type} Session</b>\n"
         f"<b>Topic:</b> <i>{escape_html(topic)}</i>\n"
         f"<b>Questions:</b> {count} MCQs\n"
-        f"<b>Session Duration:</b> ~30 minutes\n"
-        f"<b>Question Interval:</b> 30 seconds\n"
-        f"<b>Solution:</b> Revealed after each poll (tap spoiler to view)\n\n"
-        f"<i>Answer the polls below. Tap the spoiler to reveal detailed explanations.</i>"
+        f"<b>Polls stay open until:</b> {Config.POLL_CLOSE_HOUR:02d}:{Config.POLL_CLOSE_MINUTE:02d} IST tonight\n\n"
+        f"<i>Answer anytime today. Explanations follow ~{Config.SOLUTION_DELAY}s after each poll.</i>"
     )

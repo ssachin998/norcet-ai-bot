@@ -50,10 +50,16 @@ quiz_scheduler: QuizScheduler | None = None
 
 
 def is_admin(user_id: int) -> bool:
-    """Check if a user ID is in the admin list."""
+    """
+    Check if a user ID is in the admin list.
+
+    SAFE DEFAULT: If no admins are configured, DENY everyone rather than
+    allowing all users. An open bot would let any Telegram user trigger
+    /postnow (burns Gemini quota), /skip, /nexttopic (disrupts topic
+    rotation), etc. Configure ADMIN_CHAT_IDS to enable commands.
+    """
     if not Config.ADMIN_CHAT_IDS:
-        # If no admins configured, allow all users (useful for development)
-        return True
+        return False
     return user_id in Config.ADMIN_CHAT_IDS
 
 
@@ -97,7 +103,7 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "<code>/topics</code> — View all topics and their status\n\n"
         "<code>/schedule</code> — View upcoming scheduled sessions\n\n"
         "<b>Admin Chat IDs:</b>\n"
-        f"<code>{', '.join(map(str, Config.ADMIN_CHAT_IDS)) if Config.ADMIN_CHAT_IDS else 'All users (dev mode)'}</code>"
+        f"<code>{', '.join(map(str, Config.ADMIN_CHAT_IDS)) if Config.ADMIN_CHAT_IDS else 'NONE SET — commands disabled for everyone!'}</code>"
     )
     try:
         await update.message.reply_text(help_text, parse_mode="HTML")

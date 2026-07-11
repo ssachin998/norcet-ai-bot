@@ -23,7 +23,7 @@ from telegram import Bot
 
 from config import Config
 from logger import log
-from telegram_poll import run_quiz_session
+from telegram_poll import run_quiz_session, close_all_open_polls
 from topic_manager import TopicManager
 
 
@@ -106,6 +106,27 @@ class QuizScheduler:
             f"{Config.EVENING_HOUR:02d}:{Config.EVENING_MINUTE:02d} {Config.TIMEZONE}"
         )
 
+        # Daily poll-closer — closes every poll posted that day so they
+        # stay open "all day" (Telegram's open_period caps at 600s, so
+        # this explicit sweep is what makes all-day polls possible).
+        self._scheduler.add_job(
+            self._run_close_polls,
+            trigger=CronTrigger(
+                hour=Config.POLL_CLOSE_HOUR,
+                minute=Config.POLL_CLOSE_MINUTE,
+                timezone=Config.TIMEZONE,
+            ),
+            id="close_daily_polls",
+            name="Close Daily Polls",
+            replace_existing=True,
+            misfire_grace_time=300,
+            max_instances=1,
+        )
+        log.info(
+            f"Daily poll-close scheduled at "
+            f"{Config.POLL_CLOSE_HOUR:02d}:{Config.POLL_CLOSE_MINUTE:02d} {Config.TIMEZONE}"
+        )
+
     async def _run_morning_session(self) -> None:
         """Execute the morning quiz session."""
         log.info("=== Morning Quiz Session Started ===")
@@ -135,6 +156,21 @@ class QuizScheduler:
             await self._notify_admin(f"Evening session failed: {e}")
         finally:
             log.info("=== Evening Quiz Session Ended ===")
+
+    async def _run_close_polls(self) -> None:
+        """Execute the daily poll-closing sweep."""
+        log.info("=== Daily Poll Close Started ===")
+        try:
+            result = await close_all_open_polls(self._bot)
+            log.info(
+                f"Daily poll close: {result['closed']} closed, "
+                f"{result['failed']} failed"
+            )
+        except Exception as e:
+            log.error(f"Daily poll close failed: {e}", exc_info=True)
+            await self._notify_admin(f"Daily poll close failed: {e}")
+        finally:
+            log.info("=== Daily Poll Close Ended ===")
 
     async def _notify_admin(self, message: str) -> None:
         """

@@ -53,6 +53,8 @@ from database import (
     start_post_history,
     update_post_history,
     get_topic_progress,
+    get_open_poll_ids,
+    mark_polls_closed,
 )
 from gemini import gemini_client, GeminiRateLimiter
 from topic_manager import TopicManager
@@ -172,7 +174,9 @@ async def _send_poll(
         correct_option_id=_option_index(correct),
         is_anonymous=True,
         is_closed=False,
-        open_period=Config.QUESTION_INTERVAL,
+        # No open_period / close_date — Telegram caps both at 600s (10 min),
+        # far too short for "open all day". The poll stays open indefinitely
+        # until the daily job explicitly closes it via bot.stop_poll().
         explanation=None,
         explanation_parse_mode=ParseMode.HTML,
         disable_notification=True,
@@ -290,16 +294,11 @@ async def run_quiz_session(
     session_type: str,
 ) -> dict:
     """
-    Run a complete 30-minute quiz session (60 questions).
+    Run a complete quiz session (Config.QUESTIONS_PER_SESSION questions).
 
-    For each question:
-      1. Generate ONE MCQ via Gemini  (rate-limited, HTTP 429 retried)
-      2. Send QuizPoll to Telegram
-      3. Generate ONE explanation via Gemini  (rate-limited, HTTP 429 retried)
-      4. Send Solution spoiler to Telegram
-      5. Fill remaining time to maintain 30s cadence
-
-    No preloading. No batching. No caching.
+    Questions are fetched in batches of Config.BATCH_SIZE via ONE Gemini
+    call per batch (question+explanation merged), then posted one-by-one
+    on the normal cadence with zero additional API calls per question.
     """
     topic = topic_manager.current_topic
     total_questions = Config.QUESTIONS_PER_SESSION
@@ -458,3 +457,55 @@ async def post_immediate_session(bot: Bot, topic_manager: TopicManager) -> dict:
     now = datetime.now(IST)
     session_type = "Morning" if now.hour < 12 else "Evening"
     return await run_quiz_session(bot, topic_manager, session_type)
+
+
+# ── Daily Poll Closer ────────────────────────────────────────
+
+async def close_all_open_polls(bot: Bot) -> dict:
+    """
+    Close every poll that hasn't been closed yet, via bot.stop_poll().
+
+    Called once daily (Config.POLL_CLOSE_HOUR:POLL_CLOSE_MINUTE) so that
+    polls posted any time that day — morning or evening session — stay
+    open for the WHOLE day and only close at end-of-day. Telegram's
+    open_period/close_date parameters can't do this directly (capped at
+    600s), so this explicit stop_poll() sweep is the workaround.
+
+    Returns:
+        Dict with counts: {"closed": int, "failed": int}
+    """
+    chat_id = parse_chat_id(Config.QUIZ_CHAT_ID)
+    open_polls = get_open_poll_ids()
+
+    if not open_polls:
+        log.info("Daily poll-close: no open polls to close.")
+        return {"closed": 0, "failed": 0}
+
+    log.info(f"Daily poll-close: closing {len(open_polls)} open polls …")
+
+    closed_ids: list[int] = []
+    failed_count = 0
+
+    for question_id, poll_message_id in open_polls:
+        try:
+            await bot.stop_poll(chat_id=chat_id, message_id=poll_message_id)
+            closed_ids.append(question_id)
+        except TelegramError as e:
+            err_str = str(e).lower()
+            # Poll already closed / message deleted — treat as done, not
+            # a failure, so it doesn't get retried forever.
+            if "already" in err_str or "not found" in err_str or "message to edit not found" in err_str:
+                closed_ids.append(question_id)
+            else:
+                log.warning(f"Failed to close poll (question_id={question_id}): {e}")
+                failed_count += 1
+        # Small delay to respect Telegram rate limits across many stop_poll calls
+        await asyncio.sleep(Config.TELEGRAM_RATE_LIMIT)
+
+    if closed_ids:
+        mark_polls_closed(closed_ids)
+
+    log.info(
+        f"Daily poll-close complete: {len(closed_ids)} closed, {failed_count} failed"
+    )
+    return {"closed": len(closed_ids), "failed": failed_count}

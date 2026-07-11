@@ -6,7 +6,7 @@ A production-ready Telegram bot for **AIIMS NORCET** (Nursing Officer Recruitmen
 
 - **Automated Daily Sessions**: Posts 50 MCQ quiz polls at 7:00 AM and 7:00 PM IST
 - **AI-Powered Questions**: Uses Google Gemini 2.5 Flash to generate NORCET-level questions
-- **Anonymous Quiz Polls**: Each question is an interactive Telegram quiz poll
+- **Anonymous Quiz Polls**: Each question is an interactive Telegram quiz poll, open all day until it auto-closes at night (`POLL_CLOSE_HOUR`)
 - **Detailed Explanations**: After each poll, sends rationale for ALL four options
 - **NORCET Pearls**: High-yield clinical pearls with every question
 - **Genuine References**: Only standard textbooks (Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC)
@@ -136,20 +136,23 @@ python bot.py
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BOT_TOKEN` | (required) | Telegram Bot token from BotFather |
-| `ADMIN_CHAT_IDS` | (all users) | Comma-separated admin Telegram user IDs |
+| `ADMIN_CHAT_IDS` | (none — commands disabled) | Comma-separated admin Telegram user IDs. **Required** for any admin command to work. |
 | `QUIZ_CHAT_ID` | (required) | Channel/group ID where polls are posted |
 | `CHANNEL_ID` | (empty) | Channel ID for notifications |
 | `GEMINI_API_KEY` | (required) | Google Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash-preview-04-17` | Gemini model to use |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model to use |
 | `TIMEZONE` | `Asia/Kolkata` | Scheduler timezone |
 | `MORNING_HOUR` | `7` | Morning session hour |
 | `MORNING_MINUTE` | `0` | Morning session minute |
 | `EVENING_HOUR` | `19` | Evening session hour (24h format) |
 | `EVENING_MINUTE` | `0` | Evening session minute |
 | `QUESTIONS_PER_SESSION` | `50` | Questions per session |
-| `POLL_OPEN_DURATION` | `120` | Poll open duration in seconds |
+| `SOLUTION_DELAY` | `15` | Seconds after poll opens until the solution text is revealed (poll stays open) |
+| `QUESTION_INTERVAL` | `30` | Seconds between the start of one question and the next |
+| `POLL_CLOSE_HOUR` | `23` | Hour (24h, IST) when all of today's polls are auto-closed |
+| `POLL_CLOSE_MINUTE` | `55` | Minute of `POLL_CLOSE_HOUR` when polls are closed |
 | `BATCH_SIZE` | `10` | Questions per Gemini API call |
-| `GEMINI_TEMPERATURE` | `0.9` | Gemini generation temperature (0.0-1.0) |
+| `GEMINI_TEMPERATURE` | `0.6` | Gemini generation temperature (0.0-1.0) |
 | `GEMINI_MAX_RETRIES` | `3` | Max API retry attempts |
 | `TELEGRAM_RATE_LIMIT` | `0.7` | Delay between Telegram messages (seconds) |
 | `MAX_TELEGRAM_RETRIES` | `3` | Max Telegram API retry attempts |

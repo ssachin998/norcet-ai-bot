@@ -46,9 +46,13 @@ class Config:
     EVENING_HOUR: int = int(os.getenv("EVENING_HOUR", "19"))
     EVENING_MINUTE: int = int(os.getenv("EVENING_MINUTE", "0"))
     QUESTIONS_PER_SESSION: int = int(os.getenv("QUESTIONS_PER_SESSION", "60"))
-    POLL_OPEN_DURATION: int = int(os.getenv("POLL_OPEN_DURATION", "30"))  # seconds
-    SOLUTION_DELAY: int = int(os.getenv("SOLUTION_DELAY", "15"))  # seconds after poll to send solution
-    QUESTION_INTERVAL: int = int(os.getenv("QUESTION_INTERVAL", "30"))  # seconds between questions
+    SOLUTION_DELAY: int = int(os.getenv("SOLUTION_DELAY", "15"))  # seconds after poll to reveal solution text (poll stays open — intentional for self-paced learning)
+    QUESTION_INTERVAL: int = int(os.getenv("QUESTION_INTERVAL", "30"))  # seconds between posting one question and the next
+    # Polls are sent WITHOUT an auto-close timer (Telegram caps open_period
+    # at 600s / 10 min, far too short for "open all day"). Instead, a daily
+    # job explicitly closes every poll posted that day at this time.
+    POLL_CLOSE_HOUR: int = int(os.getenv("POLL_CLOSE_HOUR", "23"))
+    POLL_CLOSE_MINUTE: int = int(os.getenv("POLL_CLOSE_MINUTE", "55"))
 
     # ── Channels ────────────────────────────────────────────
     CHANNEL_ID: str = os.getenv("CHANNEL_ID", "")  # e.g. "@norcet_quiz" or "-100123456"
@@ -62,7 +66,7 @@ class Config:
 
     # ── Gemini Generation Settings ────────────────────────────
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "10"))  # questions per API call
-    GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
+    GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.6"))
     GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     GEMINI_RETRY_DELAY: int = int(os.getenv("GEMINI_RETRY_DELAY", "5"))  # seconds
     GEMINI_RATE_LIMIT_MAX: int = int(os.getenv("GEMINI_RATE_LIMIT_MAX", "4"))  # max requests per rolling window
@@ -95,5 +99,12 @@ class Config:
         if abs(difficulty_sum - 1.0) > 0.01:
             errors.append(
                 f"Difficulty weights must sum to 1.0, got {difficulty_sum}"
+            )
+        if not cls.ADMIN_CHAT_IDS:
+            print(
+                "⚠️  WARNING: ADMIN_CHAT_IDS is not set. Admin commands "
+                "(/postnow, /skip, /nexttopic, etc.) will be DISABLED for "
+                "everyone until this is configured. Set it in Railway/your "
+                ".env to your Telegram user ID."
             )
         return errors
