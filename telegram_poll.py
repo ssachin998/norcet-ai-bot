@@ -40,6 +40,7 @@ from utils import (
     escape_html,
     sanitize_text,
     truncate_text,
+    truncate_poll_text,
     randomize_options,
     parse_chat_id,
     format_session_header,
@@ -159,16 +160,16 @@ async def _send_poll(
     """
     correct = question.get("correct_answer", "A").upper()
     options = [
-        InputPollOption(text=sanitize_text(question.get("optionA", "")), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=sanitize_text(question.get("optionB", "")), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=sanitize_text(question.get("optionC", "")), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=sanitize_text(question.get("optionD", "")), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionA", "")), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionB", "")), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionC", "")), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionD", "")), 100), text_parse_mode=ParseMode.HTML),
     ]
 
     msg = await async_retry(
         bot.send_poll,
         chat_id=chat_id,
-        question=sanitize_text(question.get("question", "")),
+        question=truncate_poll_text(sanitize_text(question.get("question", "")), 300),
         options=options,
         type=Poll.QUIZ,
         correct_option_id=_option_index(correct),

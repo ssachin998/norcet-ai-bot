@@ -49,6 +49,21 @@ def truncate_text(text: str, max_length: int = 4096) -> str:
     return text[:max_length - 20] + "\n\n[...truncated]"
 
 
+def truncate_poll_text(text: str, max_length: int) -> str:
+    """
+    Truncate poll question/option text to Telegram's hard limits.
+
+    Telegram enforces: poll question <= 300 chars, poll option <= 100 chars.
+    Unlike truncate_text() (used for regular messages, limit 4096), this
+    keeps the cut short and clean so quiz polls never get rejected by
+    Telegram's BadRequest "length must not exceed N" error.
+    """
+    text = (text or "").strip()
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - 1].rstrip() + "…"
+
+
 def randomize_options(question: dict[str, Any]) -> dict[str, Any]:
     """
     Randomize the order of options in a question while keeping

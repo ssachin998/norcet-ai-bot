@@ -142,11 +142,11 @@ Difficulty level: {difficulty}
 
 Return a single JSON object (NOT an array) with EXACTLY these fields:
 {{
-  "question": "The question text",
-  "optionA": "First option",
-  "optionB": "Second option",
-  "optionC": "Third option",
-  "optionD": "Fourth option",
+  "question": "The question text (HARD LIMIT: under 280 characters)",
+  "optionA": "First option (HARD LIMIT: under 90 characters)",
+  "optionB": "Second option (HARD LIMIT: under 90 characters)",
+  "optionC": "Third option (HARD LIMIT: under 90 characters)",
+  "optionD": "Fourth option (HARD LIMIT: under 90 characters)",
   "correct_answer": "The correct option letter — exactly A, B, C, or D",
   "difficulty": "{difficulty}"
 }}
@@ -156,6 +156,9 @@ Requirements:
 - All four options must be plausible.
 - The correct answer must be unambiguously correct.
 - Never repeat a question pattern you have generated before.
+- HARD LIMIT: "question" must be under 280 characters — keep clinical
+  vignettes short and to the point, no filler sentences.
+- HARD LIMIT: every option (optionA-D) must be under 90 characters.
 
 Return ONLY the JSON object. No markdown, no explanation, no code fences.
 """
@@ -224,11 +227,11 @@ Do NOT repeat the same question pattern (e.g., do not make all questions start w
 
 Return a JSON array (a list) of exactly {count} objects. Each object must have EXACTLY these fields:
 {{
-  "question": "The question text",
-  "optionA": "First option",
-  "optionB": "Second option",
-  "optionC": "Third option",
-  "optionD": "Fourth option",
+  "question": "The question text (HARD LIMIT: under 280 characters)",
+  "optionA": "First option (HARD LIMIT: under 90 characters)",
+  "optionB": "Second option (HARD LIMIT: under 90 characters)",
+  "optionC": "Third option (HARD LIMIT: under 90 characters)",
+  "optionD": "Fourth option (HARD LIMIT: under 90 characters)",
   "correct_answer": "The correct option letter — exactly A, B, C, or D",
   "difficulty": "Easy | Moderate | Hard",
   "question_type": "One of: clinical_scenario, factual_recall, negative_framing, priority_first, superlative, lab_interpretation, pharmacology, anatomy, sequencing, program_policy, differentiation, emergency, milestone, cause_reason, mental_health, nutrition, infection_control, community_health, vital_sign_trend",
@@ -253,6 +256,12 @@ Requirements:
 - No two questions in this batch may repeat the same question pattern.
 - Questions must resemble NORCET Previous Year Questions in style.
 - Avoid 'All of the above' and 'None of the above' as options.
+- HARD LIMIT: every "question" must be under 280 characters — keep
+  clinical vignettes short and to the point, no filler sentences.
+- HARD LIMIT: every option (optionA-D) must be under 90 characters.
+  These two limits are non-negotiable regardless of question count or
+  difficulty — a question that cannot fit under 280 characters must be
+  rewritten more concisely, not truncated mid-sentence.
 
 Return ONLY the JSON array of {count} objects. No markdown, no explanation, no code fences.
 """
