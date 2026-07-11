@@ -245,11 +245,39 @@ async def _post_one_question(
     """
     q_start = time.monotonic()
     try:
-        # Duplicate check — if it's a dup, just skip it (no regeneration,
-        # to avoid burning an extra API call outside the batch).
-        if duplicate_checker.is_duplicate(question.get("question", "")):
-            log.info(f"Q{question_number}: Duplicate detected, skipping (no regen).")
-            return None
+        # Duplicate check — try to regenerate a fresh replacement instead
+        # of just dropping the slot. Capped at 2 regen attempts so a
+        # persistently duplicate-prone difficulty/topic can't loop forever
+        # or burn the whole session's API quota. Every regenerated
+        # question is re-checked for duplicates before being accepted.
+        max_regens = 2
+        regen_attempt = 0
+        while duplicate_checker.is_duplicate(question.get("question", "")):
+            regen_attempt += 1
+            if regen_attempt > max_regens:
+                log.info(
+                    f"Q{question_number}: Still duplicate after "
+                    f"{max_regens} regen attempts, skipping."
+                )
+                return None
+
+            log.info(
+                f"Q{question_number}: Duplicate detected "
+                f"(regen attempt {regen_attempt}/{max_regens}) — requesting replacement."
+            )
+            try:
+                replacements = await gemini_client.generate_question_batch(
+                    topic=topic,
+                    difficulties=[question.get("difficulty", "Moderate")],
+                )
+            except Exception as e:
+                log.warning(f"Q{question_number}: Replacement generation failed: {e}")
+                replacements = []
+
+            if not replacements:
+                log.info(f"Q{question_number}: No replacement available, skipping.")
+                return None
+            question = replacements[0]
 
         # Randomize option order
         question = randomize_options(question)

@@ -67,6 +67,11 @@ class Config:
     # ── Gemini Generation Settings ────────────────────────────
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "10"))  # questions per API call
     GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.6"))
+    # Output token ceiling per Gemini call. A batch of 10 fully-merged
+    # MCQ+explanation items (rationales, memory tricks, pearls, refs) is
+    # verbose — too low a limit truncates the JSON mid-response and makes
+    # the whole batch unparseable. 8192 gives headroom for BATCH_SIZE=10.
+    GEMINI_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192"))
     GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     GEMINI_RETRY_DELAY: int = int(os.getenv("GEMINI_RETRY_DELAY", "5"))  # seconds
     GEMINI_RATE_LIMIT_MAX: int = int(os.getenv("GEMINI_RATE_LIMIT_MAX", "4"))  # max requests per rolling window

@@ -30,6 +30,7 @@ import google.generativeai as genai
 from config import Config
 from logger import log
 from database import generate_question_hash
+from norcet_pyq import get_pyq_style_guidance
 
 
 # ── Rate Limiter ──────────────────────────────────────────────
@@ -104,21 +105,33 @@ gemini_rate_limiter = GeminiRateLimiter(
 
 # ── Prompt Templates ──────────────────────────────────────────
 
+# ── Build SYSTEM_INSTRUCTION with PYQ style guidance ─────
+
+PYQ_STYLE_GUIDANCE = get_pyq_style_guidance()
+
 SYSTEM_INSTRUCTION = (
     "You are a senior nursing professor and NORCET question paper setter "
     "at AIIMS New Delhi. You have 20+ years of experience setting "
     "competitive examination questions for B.Sc Nursing, Post Basic "
     "B.Sc Nursing, and M.Sc Nursing entrance examinations (NORCET).\n\n"
-    "Rules:\n"
-    "- Resemble AIIMS NORCET Previous Year Questions.\n"
-    "- Test clinical application, not mere recall.\n"
+    "CORE RULES:\n"
+    "- Resemble AIIMS NORCET Previous Year Questions (PYQs) exactly.\n"
+    "- Mix question TYPES within every batch: clinical scenarios, factual recall, "
+    "NOT/EXCEPT, FIRST action, MOST/BEST, lab interpretation, pharmacology, "
+    "sequencing, differentiation, programs/policies, emergency care, milestones, "
+    "mental health, nutrition, infection control, community health, etc.\n"
+    "- NEVER generate all questions in the same format or pattern.\n"
+    "- Test clinical application and reasoning, not mere rote recall.\n"
     "- Be factually accurate and evidence-based.\n"
     "- Use ONLY genuine references: Robbins, KDT, Apurba Sastry, "
-    "Brunner, AIIMS Protocol, WHO, CDC.\n"
-    "- Never fabricate references.\n"
-    "- Questions must be original and unique.\n"
-    "- Use proper medical terminology.\n"
-    "- Every question must have exactly ONE correct answer.\n"
+    "Brunner, AIIMS Protocol, WHO, CDC, Park & Park.\n"
+    "- Never fabricate references or book citations.\n"
+    "- Questions must be original and unique — do NOT copy actual PYQs.\n"
+    "- Use proper medical terminology and standard nursing abbreviations.\n"
+    "- Every question must have exactly ONE correct answer (A, B, C, or D).\n"
+    "- Options must be plausible, similar in length, and avoid 'All of the above'.\n"
+    "\n"
+    + PYQ_STYLE_GUIDANCE
 )
 
 
@@ -190,8 +203,26 @@ Assign each question one of these difficulty levels, IN THIS EXACT ORDER
 (question 1 gets the 1st difficulty listed, question 2 the 2nd, etc.):
 {difficulties}
 
-Return a JSON array (a list) of exactly {count} objects — NOT wrapped in any
-other object. Each object must have EXACTLY these fields:
+CRITICAL: You MUST vary the question type across the batch. Include a MIX of:
+- Clinical scenario + nursing action/priority (at least 3-4 questions)
+- Factual recall / lab value / drug dosage (at least 2 questions)
+- NOT / EXCEPT / negative framing (at least 1 question)
+- Priority / FIRST / IMMEDIATE action (at least 1 question)
+- MOST / BEST / LEAST superlative (at least 1 question)
+- Sequencing / ordering steps (at least 1 question if possible)
+- Differentiation / comparison (Condition A vs B) (at least 1 question)
+- Program / policy / national health scheme (at least 1 question if topic fits)
+- Lab value interpretation with specific units
+- Drug pharmacology / contraindication / side effect
+- Cause / reason / pathophysiology
+- Growth & development milestone
+- Emergency / critical care scenario
+- Mental health / psychiatric nursing
+
+Do NOT repeat the same question pattern (e.g., do not make all questions start with
+'A patient presents with...'). Rotate formats aggressively.
+
+Return a JSON array (a list) of exactly {count} objects. Each object must have EXACTLY these fields:
 {{
   "question": "The question text",
   "optionA": "First option",
@@ -200,6 +231,7 @@ other object. Each object must have EXACTLY these fields:
   "optionD": "Fourth option",
   "correct_answer": "The correct option letter — exactly A, B, C, or D",
   "difficulty": "Easy | Moderate | Hard",
+  "question_type": "One of: clinical_scenario, factual_recall, negative_framing, priority_first, superlative, lab_interpretation, pharmacology, anatomy, sequencing, program_policy, differentiation, emergency, milestone, cause_reason, mental_health, nutrition, infection_control, community_health, vital_sign_trend",
   "correct_rationale": "Detailed explanation of why the correct answer is correct. Include pathophysiology, pharmacology, or clinical reasoning. 2-4 sentences.",
   "rationale_wrong_options": {{
     "A": "Why option A is wrong (2-3 sentences)",
@@ -209,16 +241,18 @@ other object. Each object must have EXACTLY these fields:
   }},
   "memory_trick": "A mnemonic or memory aid to remember the answer. Keep it short and catchy.",
   "pearl": "A high-yield NORCET exam point related to this question concept.",
-  "reference": "Genuine textbook reference. Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC."
+  "reference": "Genuine textbook reference. Use ONLY: Robbins, KDT, Apurba Sastry, Brunner, AIIMS Protocol, WHO, CDC, Park & Park."
 }}
 
 Requirements:
-- Every question must test clinical application, not mere recall.
-- All four options must be plausible.
+- Every question must test clinical application or reasoning.
+- All four options must be plausible and similar in length.
 - The correct answer must be unambiguously correct.
 - Each rationale must explain WHY with clinical reasoning.
 - The reference must be a REAL textbook citation.
 - No two questions in this batch may repeat the same question pattern.
+- Questions must resemble NORCET Previous Year Questions in style.
+- Avoid 'All of the above' and 'None of the above' as options.
 
 Return ONLY the JSON array of {count} objects. No markdown, no explanation, no code fences.
 """
@@ -337,6 +371,7 @@ class GeminiClient:
             generation_config=genai.GenerationConfig(
                 temperature=Config.GEMINI_TEMPERATURE,
                 response_mime_type="application/json",
+                max_output_tokens=Config.GEMINI_MAX_OUTPUT_TOKENS,
             ),
         )
 
@@ -347,6 +382,7 @@ class GeminiClient:
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 response_mime_type="application/json",
+                max_output_tokens=Config.GEMINI_MAX_OUTPUT_TOKENS,
             ),
         )
 
@@ -395,6 +431,26 @@ class GeminiClient:
                 response = await loop.run_in_executor(
                     None, model.generate_content, prompt
                 )
+
+                # Detect truncated output early. If Gemini stopped because
+                # it hit the token ceiling (not because it finished
+                # naturally), the JSON will be incomplete and unparseable
+                # downstream — log it now so it's obvious in Railway logs
+                # instead of showing up only as a cryptic JSON parse error.
+                try:
+                    candidates = getattr(response, "candidates", None)
+                    if candidates:
+                        finish_reason = getattr(candidates[0], "finish_reason", None)
+                        fr_name = getattr(finish_reason, "name", str(finish_reason))
+                        if fr_name and fr_name not in ("STOP", "1"):
+                            log.warning(
+                                f"Gemini finish_reason={fr_name} (attempt {attempt}) — "
+                                "response may be truncated (e.g. MAX_TOKENS). "
+                                "Consider raising GEMINI_MAX_OUTPUT_TOKENS."
+                            )
+                except Exception:
+                    pass  # diagnostic only — never let this break the call
+
                 return response.text
 
             except Exception as exc:
@@ -580,6 +636,76 @@ class GeminiClient:
             "reference": str(data.get("reference", "")).strip(),
         }
 
+    # ── Internal: fetch a batch, retrying + shrinking on parse failure ──
+
+    async def _fetch_batch_with_fallback(
+        self,
+        topic: str,
+        difficulties: list[str],
+        _depth: int = 0,
+    ) -> list[dict]:
+        """
+        Fetch one batch's raw JSON items, with resilience against the
+        JSON-truncation failure mode (ValueError from _extract_json_array).
+
+        A ValueError here means Gemini returned successfully (no 429/
+        network error, so _call_gemini's own retry loop doesn't apply)
+        but the JSON was malformed/incomplete — almost always because the
+        response was cut off at the token ceiling. Strategy:
+          1. Retry the SAME batch size up to 2 times (transient truncation
+             sometimes doesn't recur).
+          2. If it keeps failing, split the batch in half and fetch each
+             half separately — smaller batches need fewer output tokens
+             and are much less likely to hit the ceiling.
+          3. Stop splitting at batch size 2; if that still fails, give up
+             on that slice (raises, caller logs + skips just that slice
+             instead of the whole original batch).
+        """
+        count = len(difficulties)
+        prompt = BATCH_MCQ_PROMPT.format(
+            topic=topic,
+            count=count,
+            difficulties=", ".join(difficulties),
+        )
+
+        last_error: Exception | None = None
+        for attempt in range(1, 3):  # 2 attempts at this size
+            raw = await self._call_gemini("mcq", prompt)
+            try:
+                return _extract_json_array(raw)
+            except ValueError as e:
+                last_error = e
+                log.warning(
+                    f"Batch parse failed at size {count} "
+                    f"(attempt {attempt}/2): {e}"
+                )
+
+        # Still failing at this size — split, unless we're already small
+        # or too deep (safety bound against runaway recursion).
+        if count <= 2 or _depth >= 3:
+            raise last_error or ValueError("Batch fetch failed with no error captured")
+
+        log.warning(
+            f"Splitting batch of {count} into two smaller batches after "
+            "repeated JSON truncation."
+        )
+        mid = count // 2
+        first_half, second_half = difficulties[:mid], difficulties[mid:]
+
+        results: list[dict] = []
+        for half in (first_half, second_half):
+            try:
+                results.extend(
+                    await self._fetch_batch_with_fallback(topic, half, _depth + 1)
+                )
+            except ValueError as e:
+                log.error(
+                    f"Sub-batch of {len(half)} still failed after split: {e}. "
+                    "Skipping this slice."
+                )
+
+        return results
+
     # ── Public: generate a BATCH of questions (question+explanation) ──
 
     async def generate_question_batch(
@@ -614,13 +740,7 @@ class GeminiClient:
             ValueError: If the response can't be parsed as a JSON array.
         """
         count = len(difficulties)
-        prompt = BATCH_MCQ_PROMPT.format(
-            topic=topic,
-            count=count,
-            difficulties=", ".join(difficulties),
-        )
-        raw = await self._call_gemini("mcq", prompt)
-        raw_items = _extract_json_array(raw)
+        raw_items = await self._fetch_batch_with_fallback(topic, difficulties)
 
         required = {
             "question", "optionA", "optionB", "optionC", "optionD",
@@ -656,6 +776,7 @@ class GeminiClient:
                 "optionD": str(item["optionD"]).strip(),
                 "correct_answer": correct,
                 "difficulty": str(item.get("difficulty", fallback_difficulty)).strip().title(),
+                "question_type": str(item.get("question_type", "")).strip(),
                 "topic": topic,
                 "rationaleA": correct_rat if correct == "A" else str(wrong.get("A", "")).strip(),
                 "rationaleB": correct_rat if correct == "B" else str(wrong.get("B", "")).strip(),

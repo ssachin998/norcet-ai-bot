@@ -101,6 +101,9 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "<code>/stats week</code> — This week's statistics\n\n"
         "<code>/stats month</code> — This month's statistics\n\n"
         "<code>/topics</code> — View all topics and their status\n\n"
+        "<code>/pyq</code> — View NORCET PYQ reference & question types\n"
+        "<code>/pyq types</code> — List all 20 PYQ question types\n"
+        "<code>/pyq sample</code> — Show sample PYQ questions\n\n"
         "<code>/schedule</code> — View upcoming scheduled sessions\n\n"
         "<b>Admin Chat IDs:</b>\n"
         f"<code>{', '.join(map(str, Config.ADMIN_CHAT_IDS)) if Config.ADMIN_CHAT_IDS else 'NONE SET — commands disabled for everyone!'}</code>"
@@ -393,6 +396,82 @@ async def cmd_topics(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Error: {e}")
 
 
+async def cmd_pyq(update: Update, context: CallbackContext) -> None:
+    """Handle /pyq command - show NORCET PYQ question types and reference info."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    try:
+        from norcet_pyq import (
+            QUESTION_TYPES,
+            PRELIMS_PYQ_SAMPLES,
+            MAINS_PYQ_SAMPLES,
+            get_all_question_types,
+        )
+
+        args = context.args if context.args else []
+
+        if args and args[0].lower() in ("types", "list"):
+            # Show all question types
+            msg = "<b>📋 NORCET PYQ Question Types</b>\n\n"
+            msg += "<i>Based on NORCET-10 Prelims & Mains Paper analysis</i>\n\n"
+            for i, qt in enumerate(QUESTION_TYPES, 1):
+                msg += f"<b>{i}.</b> <code>{qt['type']}</code>\n"
+            msg += (
+                f"\n<b>Total: {len(QUESTION_TYPES)} question types</b>\n\n"
+                "The bot generates questions from ALL these types.\n"
+                "Every batch includes a mix — no two consecutive questions\n"
+                "share the same format."
+            )
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+        elif args and args[0].lower() in ("sample", "examples"):
+            # Show sample PYQ questions
+            msg = "<b>📝 NORCET PYQ Sample Questions</b>\n\n"
+            msg += "<b>━━━ Prelims Paper ━━━</b>\n"
+            for i, q in enumerate(PRELIMS_PYQ_SAMPLES[:5], 1):
+                msg += f"\n<b>Q{i}.</b> {escape_html(q)}"
+            msg += "\n\n<b>━━━ Mains Paper ━━━</b>\n"
+            for i, q in enumerate(MAINS_PYQ_SAMPLES[:5], 1):
+                msg += f"\n<b>Q{i}.</b> {escape_html(q)}"
+            msg += (
+                f"\n\n<i>These are real NORCET-10 PYQs (memory based). "
+                "The bot generates NEW original questions in the same style.</i>"
+            )
+            # Split if too long
+            if len(msg) > 4000:
+                parts = [msg[:4000]]
+                while len(msg) > 4000:
+                    msg = msg[4000:]
+                    parts.append(msg[:4000])
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode="HTML")
+                    await asyncio.sleep(0.5)
+            else:
+                await update.message.reply_text(msg, parse_mode="HTML")
+
+        else:
+            # Default: show summary
+            type_count = len(get_all_question_types())
+            msg = (
+                "<b>📋 NORCET PYQ Reference</b>\n\n"
+                "<b>Papers Analyzed:</b>\n"
+                "• NORCET-10 Prelims (11 April 2026)\n"
+                "• NORCET-10 Mains (30 April 2026)\n\n"
+                f"<b>Question Types Identified:</b> {type_count}\n\n"
+                "<b>Commands:</b>\n"
+                "<code>/pyq types</code> — List all question types\n"
+                "<code>/pyq sample</code> — Show sample PYQ questions\n\n"
+                "<i>The bot generates questions matching these PYQ patterns. "
+                "Every batch includes variety across all types.</i>"
+            )
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        log.error(f"Failed to show PYQ info: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def cmd_schedule(update: Update, context: CallbackContext) -> None:
     """Handle /schedule command - show upcoming scheduled sessions."""
     if not is_admin(update.effective_user.id):
@@ -470,6 +549,7 @@ async def post_init(application: Application) -> None:
         BotCommand("postnow", "Post quiz immediately"),
         BotCommand("stats", "View statistics (today/week/month)"),
         BotCommand("topics", "View all topics and status"),
+        BotCommand("pyq", "NORCET PYQ reference & question types"),
         BotCommand("schedule", "View upcoming scheduled sessions"),
     ]
     await application.bot.set_my_commands(commands)
@@ -558,6 +638,7 @@ def main() -> None:
     application.add_handler(CommandHandler("postnow", cmd_post_now))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("topics", cmd_topics))
+    application.add_handler(CommandHandler("pyq", cmd_pyq))
     application.add_handler(CommandHandler("schedule", cmd_schedule))
 
     # Register error handler
