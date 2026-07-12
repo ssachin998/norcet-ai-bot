@@ -103,6 +103,19 @@ gemini_rate_limiter = GeminiRateLimiter(
 )
 
 
+# Safety floor for output tokens. A 10-question batch (question + 4
+# options + full rationale for all 4 + memory trick + pearl + reference,
+# per question) needs real headroom — too low a ceiling causes the
+# response to cut off mid-JSON (finish_reason=MAX_TOKENS), which is what
+# was truncating batches. gemini-3.5-flash allows up to 65,536 output
+# tokens; 16,384 gives comfortable margin for a 7-question batch (see
+# telegram_poll.py's batch_size cap) without wasting free-tier
+# tokens-per-minute budget the way maxing out to 65,536 would.
+# max() here means: if Config.GEMINI_MAX_OUTPUT_TOKENS is ever set lower
+# than this, the floor still applies — no config.py edit required.
+MIN_SAFE_OUTPUT_TOKENS = 16384
+
+
 # ── Prompt Templates ──────────────────────────────────────────
 
 # ── Build SYSTEM_INSTRUCTION with PYQ style guidance ─────
@@ -373,6 +386,8 @@ class GeminiClient:
 
         genai.configure(api_key=Config.GEMINI_API_KEY)
 
+        output_tokens = max(Config.GEMINI_MAX_OUTPUT_TOKENS, MIN_SAFE_OUTPUT_TOKENS)
+
         # MCQ model — strict JSON output
         self._mcq_model = genai.GenerativeModel(
             model_name=Config.GEMINI_MODEL,
@@ -380,7 +395,7 @@ class GeminiClient:
             generation_config=genai.GenerationConfig(
                 temperature=Config.GEMINI_TEMPERATURE,
                 response_mime_type="application/json",
-                max_output_tokens=Config.GEMINI_MAX_OUTPUT_TOKENS,
+                max_output_tokens=output_tokens,
             ),
         )
 
@@ -391,13 +406,14 @@ class GeminiClient:
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 response_mime_type="application/json",
-                max_output_tokens=Config.GEMINI_MAX_OUTPUT_TOKENS,
+                max_output_tokens=output_tokens,
             ),
         )
 
         self._initialized = True
         log.info(
             f"Gemini client initialized — model: {Config.GEMINI_MODEL}, "
+            f"max_output_tokens: {output_tokens}, "
             f"rate limit: {Config.GEMINI_RATE_LIMIT_MAX} req / "
             f"{Config.GEMINI_RATE_LIMIT_WINDOW}s"
         )
@@ -689,16 +705,20 @@ class GeminiClient:
                     f"(attempt {attempt}/2): {e}"
                 )
 
-        # Still failing at this size — split, unless we're already small
-        # or too deep (safety bound against runaway recursion).
-        if count <= 2 or _depth >= 3:
+        # Still failing at this size — split, unless we're already at a
+        # single question (can't split further) or too deep (safety bound
+        # against runaway recursion). Deliberately goes all the way down
+        # to size-1 — a single-question call has the best chance of
+        # fitting under the token ceiling, so it's worth trying before
+        # giving up on a question entirely.
+        if count <= 1 or _depth >= 4:
             raise last_error or ValueError("Batch fetch failed with no error captured")
 
         log.warning(
             f"Splitting batch of {count} into two smaller batches after "
             "repeated JSON truncation."
         )
-        mid = count // 2
+        mid = max(1, count // 2)
         first_half, second_half = difficulties[:mid], difficulties[mid:]
 
         results: list[dict] = []

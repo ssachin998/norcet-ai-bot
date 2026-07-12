@@ -75,11 +75,11 @@ def format_solution(question: dict, question_number: int) -> str:
     Hidden (inside spoiler): everything else.
 
     Inside the spoiler:
-      ✔ Correct Answer
-      ✔ Why correct option is correct
-      ✔ Why every wrong option is wrong
-      ✔ NORCET memory trick
-      ✔ High-yield exam point
+      ✅ Correct Answer
+      ✅ Why correct option is correct
+      ❌ Why every wrong option is wrong
+      🧠 NORCET memory trick
+      ⭐ High-yield exam point
     """
     correct = question.get("correct_answer", "A").upper()
     option_labels = ["A", "B", "C", "D"]
@@ -93,23 +93,23 @@ def format_solution(question: dict, question_number: int) -> str:
         '<span class="tg-spoiler">',
     ]
 
-    # ✔ Correct answer
+    # ✅ Correct answer — green check, distinct from the ❌ used on wrong options
     correct_text = question.get(option_keys[correct_idx], "")
-    parts.append(f"\u2714\ufe0f <b>Correct Answer: {correct}.</b> {escape_html(correct_text)}")
+    parts.append(f"\u2705 <b>Correct Answer: {correct}.</b> {escape_html(correct_text)}")
     parts.append("")
 
-    # ✔ Why correct
+    # ✅ Why correct
     correct_rationale = question.get(rationale_keys[correct_idx], "").strip()
     if correct_rationale:
-        parts.append("\u2714\ufe0f <b>Why {correct} is correct:</b>")
+        parts.append(f"\u2705 <b>Why {correct} is correct:</b>")
         parts.append(f"<i>{escape_html(correct_rationale)}</i>")
         parts.append("")
 
-    # ✔ Why each wrong option is wrong
+    # ❌ Why each wrong option is wrong — red cross, clearly different from ✅ above
     for label, opt_key, rat_key in zip(option_labels, option_keys, rationale_keys):
         if label != correct:
             rationale = question.get(rat_key, "").strip()
-            parts.append(f"\u2714\ufe0f <b>Why Option {label} is wrong:</b>")
+            parts.append(f"\u274c <b>Why Option {label} is wrong:</b>")
             if rationale:
                 parts.append(f"<i>{escape_html(rationale)}</i>")
             else:
@@ -117,17 +117,17 @@ def format_solution(question: dict, question_number: int) -> str:
                 parts.append(f"<i>{escape_html(opt_text)} is incorrect.</i>")
             parts.append("")
 
-    # ✔ Memory trick / NORCET exam trick
+    # 🧠 Memory trick / NORCET exam trick
     memory_trick = question.get("memory_trick", "").strip()
     if memory_trick:
-        parts.append("\u2714\ufe0f <b>NORCET Memory Trick:</b>")
+        parts.append("\U0001f9e0 <b>NORCET Memory Trick:</b>")
         parts.append(f"<i>{escape_html(memory_trick)}</i>")
         parts.append("")
 
-    # ✔ High-yield exam point
+    # ⭐ High-yield exam point
     pearl = question.get("pearl", "").strip()
     if pearl:
-        parts.append("\u2714\ufe0f <b>High-Yield Exam Point:</b>")
+        parts.append("\u2b50 <b>High-Yield Exam Point:</b>")
         parts.append(f"<i>{escape_html(pearl)}</i>")
         parts.append("")
 
@@ -159,17 +159,26 @@ async def _send_poll(
     Send one QuizPoll to Telegram. Returns the message_id on success.
     """
     correct = question.get("correct_answer", "A").upper()
+    # NOTE: options use text_parse_mode=HTML, so any raw "<", ">", "&" in the
+    # option text (e.g. "HCO3 <22 mEq/L") gets misread as an HTML tag by
+    # Telegram and the whole send_poll call fails with "Can't parse
+    # entities: unsupported start tag". escape_html() must run BEFORE
+    # truncate_poll_text() so we never cut a string in the middle of an
+    # escaped entity like "&lt;" and the 100-char cap applies to the final
+    # (escaped) string Telegram actually receives.
     options = [
-        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionA", "")), 100), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionB", "")), 100), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionC", "")), 100), text_parse_mode=ParseMode.HTML),
-        InputPollOption(text=truncate_poll_text(sanitize_text(question.get("optionD", "")), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(escape_html(sanitize_text(question.get("optionA", ""))), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(escape_html(sanitize_text(question.get("optionB", ""))), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(escape_html(sanitize_text(question.get("optionC", ""))), 100), text_parse_mode=ParseMode.HTML),
+        InputPollOption(text=truncate_poll_text(escape_html(sanitize_text(question.get("optionD", ""))), 100), text_parse_mode=ParseMode.HTML),
     ]
 
     msg = await async_retry(
         bot.send_poll,
         chat_id=chat_id,
-        question=truncate_poll_text(sanitize_text(question.get("question", "")), 300),
+        question=truncate_poll_text(
+            f"Q{question_number}. {sanitize_text(question.get('question', ''))}", 300
+        ),
         options=options,
         type=Poll.QUIZ,
         correct_option_id=_option_index(correct),
@@ -358,7 +367,13 @@ async def run_quiz_session(
     # ── Main loop: fetch in batches, post one-by-one on cadence ──
     posted_questions: list[dict] = []
     failed_count = 0
-    batch_size = max(1, Config.BATCH_SIZE)
+    # Capped at 5 regardless of Config.BATCH_SIZE: a smaller batch means a
+    # shorter Gemini response per call, which cuts MAX_TOKENS truncation
+    # risk almost to zero WITHOUT shortening any question/option/rationale
+    # (same prompt, same per-question detail — just fewer questions packed
+    # into one response). Slightly more API calls per session, but well
+    # within the free-tier RPD budget.
+    batch_size = min(max(1, Config.BATCH_SIZE), 5)
 
     for batch_start in range(0, total_questions, batch_size):
         batch_end = min(batch_start + batch_size, total_questions)

@@ -65,13 +65,15 @@ class Config:
     TOPICS_FILE: str = os.getenv("TOPICS_FILE", "topics.txt")
 
     # ── Gemini Generation Settings ────────────────────────────
-    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "10"))  # questions per API call
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "5"))  # questions per API call
     GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.6"))
-    # Output token ceiling per Gemini call. A batch of 10 fully-merged
-    # MCQ+explanation items (rationales, memory tricks, pearls, refs) is
-    # verbose — too low a limit truncates the JSON mid-response and makes
-    # the whole batch unparseable. 8192 gives headroom for BATCH_SIZE=10.
-    GEMINI_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192"))
+    # Output token ceiling per Gemini call. Even with BATCH_SIZE=5, a
+    # fully-merged MCQ+explanation item (rationales, memory trick, pearl,
+    # reference) is verbose — too low a limit truncates the JSON
+    # mid-response and makes the whole batch unparseable. 16384 gives
+    # comfortable headroom (matches the safety floor in gemini.py's
+    # MIN_SAFE_OUTPUT_TOKENS, so both files agree).
+    GEMINI_MAX_OUTPUT_TOKENS: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "16384"))
     GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     GEMINI_RETRY_DELAY: int = int(os.getenv("GEMINI_RETRY_DELAY", "5"))  # seconds
     GEMINI_RATE_LIMIT_MAX: int = int(os.getenv("GEMINI_RATE_LIMIT_MAX", "4"))  # max requests per rolling window
