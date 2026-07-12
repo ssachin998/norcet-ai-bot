@@ -105,6 +105,9 @@ async def cmd_help(update: Update, context: CallbackContext) -> None:
         "<code>/pyq types</code> — List all 20 PYQ question types\n"
         "<code>/pyq sample</code> — Show sample PYQ questions\n\n"
         "<code>/schedule</code> — View upcoming scheduled sessions\n\n"
+        "<code>/jumptopic &lt;name&gt;</code> — Jump to a topic by name\n\n"
+        "<code>/addtopic &lt;name&gt;</code> — Add a new topic\n\n"
+        "<code>/setschedule &lt;morning|evening&gt; &lt;hour&gt; &lt;minute&gt;</code> — Change session time\n\n"
         "<b>Admin Chat IDs:</b>\n"
         f"<code>{', '.join(map(str, Config.ADMIN_CHAT_IDS)) if Config.ADMIN_CHAT_IDS else 'NONE SET — commands disabled for everyone!'}</code>"
     )
@@ -133,6 +136,10 @@ async def cmd_status(update: Update, context: CallbackContext) -> None:
 
         scheduler_status = "Running ✅" if quiz_scheduler and quiz_scheduler.is_running() else "Stopped ❌"
 
+        times = quiz_scheduler.get_current_times() if quiz_scheduler else None
+        morning_h, morning_m = times["morning"] if times else (Config.MORNING_HOUR, Config.MORNING_MINUTE)
+        evening_h, evening_m = times["evening"] if times else (Config.EVENING_HOUR, Config.EVENING_MINUTE)
+
         status_text = (
             "<b>📊 NORCET Bot Status</b>\n\n"
             f"<b>Bot:</b> {scheduler_status}\n"
@@ -147,8 +154,8 @@ async def cmd_status(update: Update, context: CallbackContext) -> None:
             f"Moderate: {difficulty_counts.get('Moderate', 0)} | "
             f"Hard: {difficulty_counts.get('Hard', 0)}\n\n"
             f"<b>⏰ Schedule:</b>\n"
-            f"• Morning: {Config.MORNING_HOUR:02d}:{Config.MORNING_MINUTE:02d} IST ({Config.QUESTIONS_PER_SESSION} MCQs)\n"
-            f"• Evening: {Config.EVENING_HOUR:02d}:{Config.EVENING_MINUTE:02d} IST ({Config.QUESTIONS_PER_SESSION} MCQs)\n\n"
+            f"• Morning: {morning_h:02d}:{morning_m:02d} IST ({Config.QUESTIONS_PER_SESSION} MCQs)\n"
+            f"• Evening: {evening_h:02d}:{evening_m:02d} IST ({Config.QUESTIONS_PER_SESSION} MCQs)\n\n"
             f"<b>💻 Gemini Model:</b> {Config.GEMINI_MODEL}\n"
             f"<b>🕐 Current Time:</b> {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}"
         )
@@ -202,19 +209,139 @@ async def cmd_skip(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Error: {e}")
 
 
-async def cmd_post_now(update: Update, context: CallbackContext) -> None:
-    """Handle /postnow command."""
+async def cmd_jump_topic(update: Update, context: CallbackContext) -> None:
+    """Handle /jumptopic <name> command — switch topic from Telegram, no redeploy."""
     if not is_admin(update.effective_user.id):
         return
 
-    try:
+    if not context.args:
         await update.message.reply_text(
-            "<b>🚀 Starting immediate quiz session...</b>",
+            "Usage: <code>/jumptopic &lt;topic name&gt;</code>\n"
+            "Example: <code>/jumptopic Biochemistry</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    name = " ".join(context.args)
+    try:
+        old_topic = topic_manager.current_topic
+        new_topic = topic_manager.jump_to_topic_by_name(name)
+        msg = (
+            f"<b>🎯 Jumped to Topic</b>\n\n"
+            f"Previous: <i>{escape_html(old_topic)}</i>\n"
+            f"Current: <i>{escape_html(new_topic)}</i>\n"
+            f"Progress: {topic_manager.current_index + 1}/{topic_manager.total_topics}"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {escape_html(str(e))}", parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Failed to jump topic: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def cmd_add_topic(update: Update, context: CallbackContext) -> None:
+    """Handle /addtopic <name> command — add a topic from Telegram, no redeploy."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/addtopic &lt;topic name&gt;</code>\n"
+            "Example: <code>/addtopic Community Health Nursing</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    name = " ".join(context.args)
+    try:
+        added = topic_manager.add_topic(name)
+        if added:
+            msg = (
+                f"<b>➕ Topic Added</b>\n\n"
+                f"'{escape_html(name)}' added — {topic_manager.total_topics} topics total.\n"
+                f"It'll come up once earlier topics finish, or jump to it now with "
+                f"<code>/jumptopic {escape_html(name)}</code>."
+            )
+        else:
+            msg = f"'{escape_html(name)}' already exists — not added again."
+        await update.message.reply_text(msg, parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Failed to add topic: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def cmd_set_schedule(update: Update, context: CallbackContext) -> None:
+    """Handle /setschedule <morning|evening> <hour> <minute> — change session timing from Telegram, no redeploy."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 3:
+        await update.message.reply_text(
+            "Usage: <code>/setschedule &lt;morning|evening&gt; &lt;hour 0-23&gt; &lt;minute 0-59&gt;</code>\n"
+            "Example: <code>/setschedule morning 8 30</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    which, hour_str, minute_str = context.args
+    session_type = which.strip().capitalize()
+    if session_type not in ("Morning", "Evening"):
+        await update.message.reply_text("First argument must be 'morning' or 'evening'.")
+        return
+
+    try:
+        hour, minute = int(hour_str), int(minute_str)
+    except ValueError:
+        await update.message.reply_text("Hour and minute must be numbers.")
+        return
+
+    try:
+        quiz_scheduler.reschedule_session(session_type, hour, minute)
+        msg = (
+            f"<b>🕐 Schedule Updated</b>\n\n"
+            f"{session_type} session: <b>{hour:02d}:{minute:02d} IST</b>\n"
+            f"(10-min reminder rescheduled to match)\n\n"
+            f"Saved to the database — survives restarts, no redeploy needed."
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {escape_html(str(e))}", parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Failed to reschedule: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
+async def cmd_post_now(update: Update, context: CallbackContext) -> None:
+    """Handle /postnow [morning|evening] command."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    # Optional override — without it, session type is guessed from the
+    # current time, which is wrong if e.g. you're recovering a missed
+    # Morning session in the evening.
+    override = None
+    if context.args:
+        arg = context.args[0].strip().capitalize()
+        if arg in ("Morning", "Evening"):
+            override = arg
+        else:
+            await update.message.reply_text(
+                "Usage: <code>/postnow</code> or <code>/postnow morning</code> / "
+                "<code>/postnow evening</code>",
+                parse_mode="HTML",
+            )
+            return
+
+    try:
+        label = override or "current time-based"
+        await update.message.reply_text(
+            f"<b>🚀 Starting immediate quiz session ({label})...</b>",
             parse_mode="HTML",
         )
 
         bot = context.bot
-        result = await post_immediate_session(bot, topic_manager)
+        result = await post_immediate_session(bot, topic_manager, session_type=override)
 
         if result.get("success"):
             msg = (
@@ -551,6 +678,9 @@ async def post_init(application: Application) -> None:
         BotCommand("topics", "View all topics and status"),
         BotCommand("pyq", "NORCET PYQ reference & question types"),
         BotCommand("schedule", "View upcoming scheduled sessions"),
+        BotCommand("jumptopic", "Jump to a topic by name"),
+        BotCommand("addtopic", "Add a new topic"),
+        BotCommand("setschedule", "Change session time (morning/evening)"),
     ]
     await application.bot.set_my_commands(commands)
     log.info("Bot commands registered")
@@ -563,14 +693,33 @@ async def post_init(application: Application) -> None:
 
     # Send startup notification to admins
     progress = topic_manager.get_progress_info()
+
+    # Fix #2: a wiped DB (e.g. no persistent volume on Railway) looks
+    # identical to a genuine first-ever run — index 0, 0 questions
+    # asked. We can't tell them apart for certain, but it's cheap and
+    # useful to flag it loudly every time so a real wipe doesn't slip
+    # by unnoticed after a routine restart.
+    reset_warning = ""
+    if topic_manager.is_fresh_start():
+        reset_warning = (
+            "⚠️ <b>Heads up:</b> topic progress is at the very start "
+            "(Topic 1, 0 questions). If the bot has run before, this "
+            "likely means the database was wiped on this deploy — "
+            "check that a persistent volume is mounted and DB_PATH "
+            "points to it. If this really is a first-time setup, "
+            "ignore this.\n\n"
+        )
+
+    times = quiz_scheduler.get_current_times()
     startup_msg = (
         f"🟢 <b>NORCET AI Bot Started</b>\n\n"
+        f"{reset_warning}"
         f"Topic: <i>{escape_html(progress['current_topic'])}</i>\n"
         f"Progress: {progress['current_index'] + 1}/{progress['total_topics']} "
         f"({progress['completion_percentage']}%)\n"
         f"Questions (this topic): {progress['questions_asked']}\n\n"
-        f"Morning: {Config.MORNING_HOUR:02d}:{Config.MORNING_MINUTE:02d} IST\n"
-        f"Evening: {Config.EVENING_HOUR:02d}:{Config.EVENING_MINUTE:02d} IST\n\n"
+        f"Morning: {times['morning'][0]:02d}:{times['morning'][1]:02d} IST\n"
+        f"Evening: {times['evening'][0]:02d}:{times['evening'][1]:02d} IST\n\n"
         f"🕐 {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}"
     )
     for admin_id in Config.ADMIN_CHAT_IDS:
@@ -640,6 +789,9 @@ def main() -> None:
     application.add_handler(CommandHandler("topics", cmd_topics))
     application.add_handler(CommandHandler("pyq", cmd_pyq))
     application.add_handler(CommandHandler("schedule", cmd_schedule))
+    application.add_handler(CommandHandler("jumptopic", cmd_jump_topic))
+    application.add_handler(CommandHandler("addtopic", cmd_add_topic))
+    application.add_handler(CommandHandler("setschedule", cmd_set_schedule))
 
     # Register error handler
     application.add_error_handler(error_handler)
@@ -655,8 +807,24 @@ def main() -> None:
     # Start the bot (polling mode)
     log.info("Starting NORCET AI Bot in polling mode...")
     print("\n🤖 NORCET AI Bot starting...")
-    print(f"   Morning session: {Config.MORNING_HOUR:02d}:{Config.MORNING_MINUTE:02d} IST")
-    print(f"   Evening session: {Config.EVENING_HOUR:02d}:{Config.EVENING_MINUTE:02d} IST")
+    # NOTE: quiz_scheduler doesn't exist yet at this point — it's built
+    # inside post_init(), which PTB only calls after run_polling()
+    # starts (i.e. AFTER this print block runs). So we read any
+    # /setschedule override straight from the DB instead. Wrapped in
+    # try/except because on a genuinely first-ever run the DB/table
+    # may not exist yet at this exact line (init_database() also runs
+    # inside post_init) — falls back to the Config .env defaults.
+    try:
+        from database import get_setting
+        morning_h = int(get_setting("morning_hour", str(Config.MORNING_HOUR)))
+        morning_m = int(get_setting("morning_minute", str(Config.MORNING_MINUTE)))
+        evening_h = int(get_setting("evening_hour", str(Config.EVENING_HOUR)))
+        evening_m = int(get_setting("evening_minute", str(Config.EVENING_MINUTE)))
+    except Exception:
+        morning_h, morning_m = Config.MORNING_HOUR, Config.MORNING_MINUTE
+        evening_h, evening_m = Config.EVENING_HOUR, Config.EVENING_MINUTE
+    print(f"   Morning session: {morning_h:02d}:{morning_m:02d} IST")
+    print(f"   Evening session: {evening_h:02d}:{evening_m:02d} IST")
     print(f"   Questions per session: {Config.QUESTIONS_PER_SESSION}")
     print(f"   Press Ctrl+C to stop.\n")
 

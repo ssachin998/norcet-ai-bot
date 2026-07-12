@@ -36,7 +36,10 @@ class TopicManager:
 
     def _load_topics(self) -> None:
         """
-        Load topics from the topics.txt file.
+        Load topics from the topics.txt file, then append any topics
+        added at runtime via /addtopic (persisted in the DB's
+        custom_topics table, not the file — so they survive a redeploy
+        even if topics.txt itself isn't on the persistent volume).
         Each line is a separate topic. Blank lines and comments are ignored.
         """
         if not os.path.exists(self._topics_file):
@@ -56,36 +59,67 @@ class TopicManager:
             if line and not line.startswith("#"):
                 self._topics.append(line)
 
-        log.info(f"Loaded {len(self._topics)} topics from {self._topics_file}")
+        from database import get_custom_topics
+        for extra in get_custom_topics():
+            if extra not in self._topics:
+                self._topics.append(extra)
+
+        log.info(f"Loaded {len(self._topics)} topics from {self._topics_file} + DB")
 
     def _restore_progress(self) -> None:
         """
         Restore topic progress from the database.
         Ensures the bot continues from where it left off after restart.
+
+        Fix #4: the stored topic NAME is the source of truth, not the
+        stored index. If topics.txt was edited/reordered/had a topic
+        inserted since the last run, the same numeric index would now
+        point at a different topic — silently derailing progress onto
+        the wrong subject. Looking the name up in the freshly-loaded
+        list avoids that: as long as the topic's name is unchanged, the
+        bot keeps following IT, regardless of where it now sits in the
+        file.
         """
         progress = get_topic_progress()
-        current_index = progress.get("current_topic_index", 0)
-        topic_name = progress.get("current_topic_name", "")
+        stored_name = progress.get("current_topic_name", "")
+        stored_index = progress.get("current_topic_index", 0)
 
-        # Validate the stored index
-        if current_index >= len(self._topics):
-            log.warning(
-                f"Stored topic index {current_index} exceeds topics count "
-                f"{len(self._topics)}. Resetting to 0."
-            )
+        if not self._topics:
+            log.warning("Topics list is empty — nothing to restore.")
+            return
+
+        if stored_name and stored_name in self._topics:
+            current_index = self._topics.index(stored_name)
+            if current_index != stored_index:
+                log.info(
+                    f"topics.txt order changed — '{stored_name}' is now at "
+                    f"position {current_index + 1} (was {stored_index + 1}). "
+                    "Continuing with the same topic by name, not position."
+                )
+                set_topic_progress(
+                    index=current_index,
+                    topic_name=stored_name,
+                    questions_asked=progress.get("questions_asked", 0),
+                    questions_total=progress.get("questions_total", 0),
+                )
+            topic_name = stored_name
+        else:
+            # First-ever run, or the stored topic no longer exists in
+            # topics.txt (renamed/removed) — fall back to the first topic.
+            if stored_name:
+                log.warning(
+                    f"Stored topic '{stored_name}' not found in "
+                    f"{self._topics_file} — falling back to the first topic. "
+                    "If you renamed a topic rather than removing it, "
+                    "progress for it won't carry over automatically."
+                )
             current_index = 0
-
-        # If topic name doesn't match, update it
-        if self._topics and (
-            not topic_name
-            or topic_name != self._topics[current_index]
-        ):
-            topic_name = self._topics[current_index]
+            topic_name = self._topics[0]
             set_topic_progress(
                 index=current_index,
                 topic_name=topic_name,
-                questions_asked=progress.get("questions_asked", 0),
-                questions_total=progress.get("questions_total", 0),
+                questions_asked=0,
+                questions_total=0,
             )
 
         log.info(
@@ -114,6 +148,22 @@ class TopicManager:
         """Get the current topic name."""
         progress = get_topic_progress()
         return progress.get("current_topic_name", "")
+
+    def is_fresh_start(self) -> bool:
+        """
+        Fix #2: heuristic used at startup to detect a suspicious
+        'reset to zero' state — topic 1, 0 questions asked — which is
+        exactly what happens when the DB got wiped (e.g. no persistent
+        volume mounted on Railway). Can't distinguish this perfectly
+        from a genuine first-ever run, so bot.py uses this to show a
+        loud warning rather than silently continuing either way.
+        """
+        progress = self.get_progress_info()
+        return (
+            progress["current_index"] == 0
+            and progress["questions_asked"] == 0
+            and progress["total_topics"] > 1
+        )
 
     def get_progress_info(self) -> dict:
         """
@@ -149,15 +199,25 @@ class TopicManager:
         Raises:
             IndexError: If all topics are exhausted.
         """
+        from database import get_setting, set_setting, log_topic_completion
+
         current_idx = self.current_index
 
         # Mark current topic as completed
         mark_topic_completed(current_idx)
 
+        cycle = int(get_setting("current_cycle", "1"))
+        log_topic_completion(current_idx, self._topics[current_idx], cycle)
+
         # Move to next topic
         next_idx = current_idx + 1
         if next_idx >= len(self._topics):
-            log.info("All topics have been completed! Restarting from topic 1.")
+            cycle += 1
+            set_setting("current_cycle", str(cycle))
+            log.info(
+                f"All topics completed for cycle {cycle - 1}! "
+                f"Starting cycle {cycle} from topic 1."
+            )
             next_idx = 0
 
         next_topic = self._topics[next_idx]
@@ -166,6 +226,7 @@ class TopicManager:
             topic_name=next_topic,
             questions_asked=0,
             questions_total=0,
+            topic_completed=0,
         )
 
         log.info(
@@ -192,6 +253,7 @@ class TopicManager:
             topic_name=next_topic,
             questions_asked=0,
             questions_total=0,
+            topic_completed=0,
         )
 
         log.info(
@@ -223,12 +285,70 @@ class TopicManager:
             topic_name=target_topic,
             questions_asked=0,
             questions_total=0,
+            topic_completed=0,
         )
 
         log.info(
             f"Jumped to topic {index + 1}/{len(self._topics)}: '{target_topic}'"
         )
         return target_topic
+
+    def jump_to_topic_by_name(self, name: str) -> str:
+        """
+        Jump to a topic by (case-insensitive, partial-match) name.
+        Used by the /jumptopic admin command — names are much easier
+        to type correctly than remembering a numeric index.
+
+        Args:
+            name: Topic name, or a distinctive substring of it.
+
+        Returns:
+            The name of the new current topic.
+
+        Raises:
+            ValueError: If no topic matches, or more than one does.
+        """
+        name_lower = name.strip().lower()
+
+        # Exact match first
+        for i, t in enumerate(self._topics):
+            if t.lower() == name_lower:
+                return self.jump_to_topic(i)
+
+        # Fall back to substring match, but only if unambiguous
+        matches = [i for i, t in enumerate(self._topics) if name_lower in t.lower()]
+        if not matches:
+            raise ValueError(f"No topic matches '{name}'.")
+        if len(matches) > 1:
+            options = ", ".join(f"'{self._topics[i]}'" for i in matches)
+            raise ValueError(
+                f"'{name}' matches multiple topics: {options}. "
+                "Be more specific."
+            )
+        return self.jump_to_topic(matches[0])
+
+    def add_topic(self, name: str) -> bool:
+        """
+        Add a new topic at runtime (used by /addtopic).
+
+        Persists to the DB's custom_topics table (survives restarts
+        even if topics.txt isn't on a persistent volume) and appends
+        to the in-memory list immediately so it's usable right away.
+
+        Returns:
+            True if added, False if it already exists.
+        """
+        from database import add_custom_topic
+
+        name = name.strip()
+        if not name or name in self._topics:
+            return False
+
+        if add_custom_topic(name):
+            self._topics.append(name)
+            log.info(f"Topic added at runtime: '{name}' (now {len(self._topics)} total)")
+            return True
+        return False
 
     def increment_questions_asked(self, count: int) -> None:
         """

@@ -135,6 +135,44 @@ def init_database() -> None:
             )
         """)
 
+        # Simple key-value store for runtime-changeable settings (e.g.
+        # schedule times set via /setschedule) that need to survive a
+        # restart. Lives on the same DB / persistent volume as
+        # everything else, so it round-trips correctly.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # Topics added at runtime via /addtopic. Kept separate from
+        # topics.txt so they persist on the DB's volume even if
+        # topics.txt itself only lives in the git repo (and would
+        # otherwise be overwritten/lost on the next deploy).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS custom_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                added_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+        # Historical record of topic completions — separate from
+        # topic_progress (which only holds the CURRENT state) so that
+        # once all topics finish and Round 2 starts, there's still a
+        # record of what was covered and when, per cycle.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS topic_completion_log (
+                topic_index INTEGER NOT NULL,
+                topic_name TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                cycle INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (topic_index, cycle)
+            )
+        """)
+
         # Initialize topic_progress row if not exists
         cursor.execute("SELECT COUNT(*) FROM topic_progress")
         if cursor.fetchone()[0] == 0:
@@ -312,7 +350,8 @@ def get_topic_progress() -> dict:
 
 
 def set_topic_progress(index: int, topic_name: str, questions_asked: int = 0,
-                       questions_total: int = 0) -> None:
+                       questions_total: int = 0,
+                       topic_completed: Optional[int] = None) -> None:
     """
     Update the topic progress in the database.
 
@@ -321,19 +360,37 @@ def set_topic_progress(index: int, topic_name: str, questions_asked: int = 0,
         topic_name: Name of the current topic.
         questions_asked: Questions asked for this topic so far.
         questions_total: Estimated total questions for this topic.
+        topic_completed: If given (0 or 1), explicitly sets the
+            completed flag. If None (default), the existing value in
+            the DB is left untouched. This matters because this
+            function is also called from increment_questions_asked()
+            after every batch — without this, every question-count
+            update was silently forcing topic_completed back to 0,
+            even moments after mark_topic_completed() had set it to 1.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE topic_progress
-            SET current_topic_index = ?,
-                current_topic_name = ?,
-                questions_asked = ?,
-                questions_total = ?,
-                topic_completed = 0,
-                last_updated = datetime('now')
-            WHERE id = 1
-        """, (index, topic_name, questions_asked, questions_total))
+        if topic_completed is None:
+            cursor.execute("""
+                UPDATE topic_progress
+                SET current_topic_index = ?,
+                    current_topic_name = ?,
+                    questions_asked = ?,
+                    questions_total = ?,
+                    last_updated = datetime('now')
+                WHERE id = 1
+            """, (index, topic_name, questions_asked, questions_total))
+        else:
+            cursor.execute("""
+                UPDATE topic_progress
+                SET current_topic_index = ?,
+                    current_topic_name = ?,
+                    questions_asked = ?,
+                    questions_total = ?,
+                    topic_completed = ?,
+                    last_updated = datetime('now')
+                WHERE id = 1
+            """, (index, topic_name, questions_asked, questions_total, topic_completed))
         conn.commit()
         log.info(f"Topic progress updated: index={index}, topic='{topic_name}'")
 
@@ -355,6 +412,107 @@ def mark_topic_completed(index: int) -> None:
         """, (index,))
         conn.commit()
         log.info(f"Topic at index {index} marked as completed")
+
+
+def log_topic_completion(topic_index: int, topic_name: str, cycle: int = 1) -> None:
+    """
+    Record that a topic was completed, on a given cycle (Round 1, 2, ...).
+
+    Safe to call more than once for the same (topic_index, cycle) —
+    the PRIMARY KEY makes it idempotent (INSERT OR IGNORE), so a retry
+    or duplicate call won't error out or overwrite the original
+    completion timestamp.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO topic_completion_log
+                (topic_index, topic_name, completed_at, cycle)
+            VALUES (?, ?, datetime('now'), ?)
+        """, (topic_index, topic_name, cycle))
+        conn.commit()
+        log.info(f"Topic completion logged: '{topic_name}' (cycle {cycle})")
+
+
+def get_topic_completion_history(topic_name: Optional[str] = None) -> list[dict]:
+    """
+    Get completion history, optionally filtered to one topic name.
+    Ordered most-recent-first — useful for e.g. "when did I last cover
+    this topic" once Round 2+ is underway.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if topic_name:
+            cursor.execute("""
+                SELECT topic_index, topic_name, completed_at, cycle
+                FROM topic_completion_log
+                WHERE topic_name = ?
+                ORDER BY completed_at DESC
+            """, (topic_name,))
+        else:
+            cursor.execute("""
+                SELECT topic_index, topic_name, completed_at, cycle
+                FROM topic_completion_log
+                ORDER BY completed_at DESC
+            """)
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Get a persisted runtime setting (e.g. 'morning_hour').
+
+    Returns the stored string value, or `default` if not set. Callers
+    are responsible for converting to int/etc as needed.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Persist a runtime setting (e.g. schedule times set via /setschedule)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+        """, (key, str(value)))
+        conn.commit()
+        log.info(f"Setting updated: {key} = {value}")
+
+
+def add_custom_topic(name: str) -> bool:
+    """
+    Persist a topic added at runtime via /addtopic.
+
+    Returns:
+        True if added, False if it already existed.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO custom_topics (name) VALUES (?)", (name,)
+            )
+            conn.commit()
+            log.info(f"Custom topic added: '{name}'")
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_custom_topics() -> list[str]:
+    """Get all topics added at runtime via /addtopic, in the order added."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM custom_topics ORDER BY id ASC")
+        return [row["name"] for row in cursor.fetchall()]
 
 
 def start_post_history(topic: str, session_type: str) -> int:

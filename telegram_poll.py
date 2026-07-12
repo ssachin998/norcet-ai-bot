@@ -326,7 +326,54 @@ async def _post_one_question(
 
 # ── Full Session ────────────────────────────────────────────
 
+# One lock per session_type ("Morning" / "Evening"), created lazily.
+# Guards against overlapping runs of the SAME session type — e.g. an
+# admin double-tapping /postnow, or /postnow racing the scheduler's
+# cron-triggered session — which would otherwise fire duplicate Gemini
+# batches and post duplicate polls.
+_session_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_session_lock(session_type: str) -> asyncio.Lock:
+    if session_type not in _session_locks:
+        _session_locks[session_type] = asyncio.Lock()
+    return _session_locks[session_type]
+
+
 async def run_quiz_session(
+    bot: Bot,
+    topic_manager: TopicManager,
+    session_type: str,
+) -> dict:
+    """
+    Public entry point for running a quiz session — used by both the
+    scheduler (cron-triggered Morning/Evening) and /postnow.
+
+    Wraps the real session logic in a per-session_type lock. If a
+    session of this type is already in progress, the new call is
+    rejected immediately (not queued — queuing would just delay a
+    duplicate run instead of preventing one).
+    """
+    lock = _get_session_lock(session_type)
+    if lock.locked():
+        log.warning(
+            f"{session_type} session already in progress — "
+            "rejecting duplicate trigger (e.g. double /postnow tap)."
+        )
+        return {
+            "success": False,
+            "error": f"A {session_type} session is already running. Please wait for it to finish.",
+            "topic": topic_manager.current_topic,
+            "session_type": session_type,
+            "questions_posted": 0,
+            "failed": 0,
+        }
+
+    async with lock:
+        return await _run_quiz_session_locked(bot, topic_manager, session_type)
+
+
+async def _run_quiz_session_locked(
     bot: Bot,
     topic_manager: TopicManager,
     session_type: str,
@@ -337,6 +384,9 @@ async def run_quiz_session(
     Questions are fetched in batches of Config.BATCH_SIZE via ONE Gemini
     call per batch (question+explanation merged), then posted one-by-one
     on the normal cadence with zero additional API calls per question.
+
+    NOTE: call run_quiz_session() (above), not this directly — that's
+    the version with the overlap guard.
     """
     topic = topic_manager.current_topic
     total_questions = Config.QUESTIONS_PER_SESSION
@@ -442,8 +492,12 @@ async def run_quiz_session(
 
     # Topic advancement
     progress = get_topic_progress()
-    questions_asked = progress.get("questions_asked", 0) + posted_count
-    QUESTIONS_PER_TOPIC = 100
+    # NOTE: increment_questions_asked() above already wrote the updated
+    # total to the DB — get_topic_progress() here re-reads that ALREADY
+    # incremented value. Adding posted_count again double-counted every
+    # session (topic hit its threshold in ~half the intended questions).
+    questions_asked = progress.get("questions_asked", 0)
+    QUESTIONS_PER_TOPIC = Config.QUESTIONS_PER_TOPIC
     if questions_asked >= QUESTIONS_PER_TOPIC:
         log.info(
             f"Topic '{topic}' reached {questions_asked} questions. Advancing."
@@ -496,10 +550,21 @@ async def run_quiz_session(
     }
 
 
-async def post_immediate_session(bot: Bot, topic_manager: TopicManager) -> dict:
-    """Trigger an immediate quiz session (used by /postnow)."""
-    now = datetime.now(IST)
-    session_type = "Morning" if now.hour < 12 else "Evening"
+async def post_immediate_session(
+    bot: Bot, topic_manager: TopicManager, session_type: Optional[str] = None
+) -> dict:
+    """
+    Trigger an immediate quiz session (used by /postnow).
+
+    Args:
+        session_type: "Morning" or "Evening" to force a specific type
+            (e.g. recovering a missed Morning session in the evening).
+            If None (default), it's inferred from the current time —
+            before noon IST counts as Morning, after as Evening.
+    """
+    if session_type is None:
+        now = datetime.now(IST)
+        session_type = "Morning" if now.hour < 12 else "Evening"
     return await run_quiz_session(bot, topic_manager, session_type)
 
 

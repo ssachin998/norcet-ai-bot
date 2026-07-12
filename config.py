@@ -37,7 +37,7 @@ class Config:
 
     # ── Google Gemini ─────────────────────────────────────────
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
     # ── Scheduler ────────────────────────────────────────────
     TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -66,6 +66,7 @@ class Config:
 
     # ── Gemini Generation Settings ────────────────────────────
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "5"))  # questions per API call
+    QUESTIONS_PER_TOPIC: int = int(os.getenv("QUESTIONS_PER_TOPIC", "100"))  # advance topic after this many
     GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.6"))
     # Output token ceiling per Gemini call. Even with BATCH_SIZE=5, a
     # fully-merged MCQ+explanation item (rationales, memory trick, pearl,
@@ -113,5 +114,15 @@ class Config:
                 "(/postnow, /skip, /nexttopic, etc.) will be DISABLED for "
                 "everyone until this is configured. Set it in Railway/your "
                 ".env to your Telegram user ID."
+            )
+        if not cls.DB_PATH.startswith(("/app/data", "/data", "/mnt")):
+            print(
+                "⚠️  WARNING: DB_PATH looks like a relative/ephemeral path "
+                f"('{cls.DB_PATH}'). On Railway this file is WIPED on every "
+                "redeploy — topic progress, duplicate-question history, and "
+                "stats will silently reset to zero. Attach a Railway Volume "
+                "and set DB_PATH to a path inside it "
+                "(e.g. DB_PATH=/app/data/norcet_bot.db) so it persists "
+                "across deploys."
             )
         return errors

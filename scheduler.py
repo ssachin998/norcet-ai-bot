@@ -78,92 +78,35 @@ class QuizScheduler:
             EVENT_JOB_MISSED,
         )
 
+    SESSIONS = ("Morning", "Evening")
+
+    def _get_session_time(self, session_type: str) -> tuple[int, int]:
+        """
+        Get the scheduled hour/minute for a session — a DB-persisted
+        override (set via /setschedule) takes priority over the
+        Config .env default. This is what lets /setschedule survive a
+        restart without needing a redeploy.
+        """
+        from database import get_setting
+
+        if session_type == "Morning":
+            default_h, default_m = Config.MORNING_HOUR, Config.MORNING_MINUTE
+        else:
+            default_h, default_m = Config.EVENING_HOUR, Config.EVENING_MINUTE
+
+        prefix = session_type.lower()
+        hour = int(get_setting(f"{prefix}_hour", str(default_h)))
+        minute = int(get_setting(f"{prefix}_minute", str(default_m)))
+        return hour, minute
+
     def _setup_jobs(self) -> None:
         """
-        Configure the morning and evening quiz session jobs.
+        Configure the Morning and Evening quiz session jobs (plus their
+        10-minute-before reminders) and the daily poll-closer.
         Jobs use CronTrigger for precise daily scheduling.
         """
-        # Morning "test starts in 10 minutes" reminder
-        morning_reminder_hour, morning_reminder_minute = _minus_minutes(
-            Config.MORNING_HOUR, Config.MORNING_MINUTE, 10
-        )
-        self._scheduler.add_job(
-            self._run_morning_reminder,
-            trigger=CronTrigger(
-                hour=morning_reminder_hour,
-                minute=morning_reminder_minute,
-                timezone=Config.TIMEZONE,
-            ),
-            id="morning_reminder",
-            name="Morning Test Reminder",
-            replace_existing=True,
-            misfire_grace_time=120,
-            max_instances=1,
-        )
-        log.info(
-            f"Morning reminder scheduled at "
-            f"{morning_reminder_hour:02d}:{morning_reminder_minute:02d} {Config.TIMEZONE}"
-        )
-
-        # Morning quiz session
-        self._scheduler.add_job(
-            self._run_morning_session,
-            trigger=CronTrigger(
-                hour=Config.MORNING_HOUR,
-                minute=Config.MORNING_MINUTE,
-                timezone=Config.TIMEZONE,
-            ),
-            id="morning_quiz",
-            name="Morning Quiz Session",
-            replace_existing=True,
-            misfire_grace_time=300,  # 5-minute grace for missed jobs
-            max_instances=1,  # Prevent overlapping sessions
-        )
-        log.info(
-            f"Morning quiz scheduled at "
-            f"{Config.MORNING_HOUR:02d}:{Config.MORNING_MINUTE:02d} {Config.TIMEZONE}"
-        )
-
-        # Evening "test starts in 10 minutes" reminder
-        evening_reminder_hour, evening_reminder_minute = _minus_minutes(
-            Config.EVENING_HOUR, Config.EVENING_MINUTE, 10
-        )
-        self._scheduler.add_job(
-            self._run_evening_reminder,
-            trigger=CronTrigger(
-                hour=evening_reminder_hour,
-                minute=evening_reminder_minute,
-                timezone=Config.TIMEZONE,
-            ),
-            id="evening_reminder",
-            name="Evening Test Reminder",
-            replace_existing=True,
-            misfire_grace_time=120,
-            max_instances=1,
-        )
-        log.info(
-            f"Evening reminder scheduled at "
-            f"{evening_reminder_hour:02d}:{evening_reminder_minute:02d} {Config.TIMEZONE}"
-        )
-
-        # Evening quiz session
-        self._scheduler.add_job(
-            self._run_evening_session,
-            trigger=CronTrigger(
-                hour=Config.EVENING_HOUR,
-                minute=Config.EVENING_MINUTE,
-                timezone=Config.TIMEZONE,
-            ),
-            id="evening_quiz",
-            name="Evening Quiz Session",
-            replace_existing=True,
-            misfire_grace_time=300,
-            max_instances=1,
-        )
-        log.info(
-            f"Evening quiz scheduled at "
-            f"{Config.EVENING_HOUR:02d}:{Config.EVENING_MINUTE:02d} {Config.TIMEZONE}"
-        )
+        for session_type in self.SESSIONS:
+            self._register_session_jobs(session_type)
 
         # Daily poll-closer — closes every poll posted that day so they
         # stay open "all day" (Telegram's open_period caps at 600s, so
@@ -178,7 +121,11 @@ class QuizScheduler:
             id="close_daily_polls",
             name="Close Daily Polls",
             replace_existing=True,
-            misfire_grace_time=300,
+            # 1 hour, not 5 min — a Railway redeploy around this time can
+            # take longer than 300s, and a late poll-close is harmless
+            # (it's just a cleanup sweep), so a generous grace window
+            # costs nothing.
+            misfire_grace_time=3600,
             max_instances=1,
         )
         log.info(
@@ -186,43 +133,99 @@ class QuizScheduler:
             f"{Config.POLL_CLOSE_HOUR:02d}:{Config.POLL_CLOSE_MINUTE:02d} {Config.TIMEZONE}"
         )
 
-    async def _run_morning_session(self) -> None:
-        """Execute the morning quiz session."""
-        log.info("=== Morning Quiz Session Started ===")
+    def _register_session_jobs(self, session_type: str) -> None:
+        """
+        Register (or re-register — replace_existing=True) both the
+        quiz-session job and its 10-minute-before reminder for one
+        session type, using whichever hour/minute is currently active.
+        Shared by _setup_jobs() at startup and reschedule_session()
+        (used by /setschedule) at runtime.
+        """
+        hour, minute = self._get_session_time(session_type)
+        reminder_hour, reminder_minute = _minus_minutes(hour, minute, 10)
+        prefix = session_type.lower()
+
+        self._scheduler.add_job(
+            self._run_session_reminder,
+            trigger=CronTrigger(
+                hour=reminder_hour, minute=reminder_minute, timezone=Config.TIMEZONE
+            ),
+            id=f"{prefix}_reminder",
+            name=f"{session_type} Test Reminder",
+            replace_existing=True,
+            misfire_grace_time=120,
+            max_instances=1,
+            kwargs={"session_type": session_type},
+        )
+        self._scheduler.add_job(
+            self._run_session,
+            trigger=CronTrigger(hour=hour, minute=minute, timezone=Config.TIMEZONE),
+            id=f"{prefix}_quiz",
+            name=f"{session_type} Quiz Session",
+            replace_existing=True,
+            # 1 hour, not 5 min — if a Railway redeploy is in progress
+            # right at 7:00 AM and the container only comes back up at
+            # 7:20, we still want the session to fire rather than
+            # silently skip the whole day.
+            misfire_grace_time=3600,
+            max_instances=1,
+            kwargs={"session_type": session_type},
+        )
+        log.info(
+            f"{session_type} quiz scheduled at {hour:02d}:{minute:02d} {Config.TIMEZONE} "
+            f"(reminder at {reminder_hour:02d}:{reminder_minute:02d})"
+        )
+
+    def get_current_times(self) -> dict:
+        """
+        Get the currently effective Morning/Evening times — reflects
+        any /setschedule override, not just the Config .env defaults.
+        Used by bot.py for the startup message and /schedule command.
+        """
+        result = {}
+        for session_type in self.SESSIONS:
+            hour, minute = self._get_session_time(session_type)
+            result[session_type.lower()] = (hour, minute)
+        return result
+
+    def reschedule_session(self, session_type: str, hour: int, minute: int) -> None:
+        """
+        Used by the /setschedule admin command. Persists the new time
+        to the DB (so it survives restarts) and immediately
+        re-registers both the session job and its reminder job — no
+        redeploy needed.
+        """
+        from database import set_setting
+
+        if session_type not in self.SESSIONS:
+            raise ValueError(f"session_type must be one of {self.SESSIONS}")
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("hour must be 0-23 and minute 0-59")
+
+        prefix = session_type.lower()
+        set_setting(f"{prefix}_hour", str(hour))
+        set_setting(f"{prefix}_minute", str(minute))
+        self._register_session_jobs(session_type)
+        log.info(f"{session_type} session rescheduled to {hour:02d}:{minute:02d} {Config.TIMEZONE}")
+
+    async def _run_session(self, session_type: str) -> None:
+        """Execute a quiz session (Morning or Evening)."""
+        log.info(f"=== {session_type} Quiz Session Started ===")
         try:
             await run_quiz_session(
                 bot=self._bot,
                 topic_manager=self._topic_manager,
-                session_type="Morning",
+                session_type=session_type,
             )
         except Exception as e:
-            log.error(f"Morning session failed: {e}", exc_info=True)
-            await self._notify_admin(f"Morning session failed: {e}")
+            log.error(f"{session_type} session failed: {e}", exc_info=True)
+            await self._notify_admin(f"{session_type} session failed: {e}")
         finally:
-            log.info("=== Morning Quiz Session Ended ===")
+            log.info(f"=== {session_type} Quiz Session Ended ===")
 
-    async def _run_evening_session(self) -> None:
-        """Execute the evening quiz session."""
-        log.info("=== Evening Quiz Session Started ===")
-        try:
-            await run_quiz_session(
-                bot=self._bot,
-                topic_manager=self._topic_manager,
-                session_type="Evening",
-            )
-        except Exception as e:
-            log.error(f"Evening session failed: {e}", exc_info=True)
-            await self._notify_admin(f"Evening session failed: {e}")
-        finally:
-            log.info("=== Evening Quiz Session Ended ===")
-
-    async def _run_morning_reminder(self) -> None:
-        """Send the 'test starts in 10 minutes' reminder for the Morning session."""
-        await self._send_test_reminder("Morning")
-
-    async def _run_evening_reminder(self) -> None:
-        """Send the 'test starts in 10 minutes' reminder for the Evening session."""
-        await self._send_test_reminder("Evening")
+    async def _run_session_reminder(self, session_type: str) -> None:
+        """Send the 'test starts in 10 minutes' reminder for a session."""
+        await self._send_test_reminder(session_type)
 
     async def _send_test_reminder(self, session_type: str) -> None:
         """
@@ -312,12 +315,24 @@ class QuizScheduler:
         )
 
     def _on_job_missed(self, event) -> None:
-        """Handle missed job executions."""
+        """
+        Handle missed job executions (e.g. Railway redeploy overlapped
+        the scheduled time and the misfire_grace_time window already
+        passed). For a missed Morning/Evening quiz job, actually
+        trigger the session immediately instead of just logging that
+        recovery "would" happen — the previous version logged a
+        recovery message but never did anything.
+
+        Safe against double-firing: run_quiz_session() already guards
+        each session_type with an asyncio.Lock, so if the real cron
+        job and this recovery both end up trying to run, only one
+        actually executes.
+        """
         log.warning(f"Scheduler job missed: {event.job_id}")
-        # Schedule recovery if needed
         if event.job_id in ("morning_quiz", "evening_quiz"):
             session_type = "Morning" if event.job_id == "morning_quiz" else "Evening"
-            log.info(f"Scheduling recovery for missed {session_type} session")
+            log.info(f"Triggering recovery run for missed {session_type} session")
+            asyncio.ensure_future(self._run_session(session_type))
 
     def start(self) -> None:
         """Start the scheduler."""

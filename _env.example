@@ -1,0 +1,50 @@
+# ── Telegram Bot ────────────────────────────────────────
+BOT_TOKEN=your_telegram_bot_token_here
+ADMIN_CHAT_IDS=123456789,987654321
+QUIZ_CHAT_ID=@your_channel_or_group_id
+CHANNEL_ID=@your_channel_or_group_id
+
+# ── Google Gemini API ─────────────────────────────────
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3-flash-preview
+
+# ── Scheduler ─────────────────────────────────────────
+TIMEZONE=Asia/Kolkata
+MORNING_HOUR=7
+MORNING_MINUTE=0
+EVENING_HOUR=19
+EVENING_MINUTE=0
+QUESTIONS_PER_SESSION=60
+QUESTIONS_PER_TOPIC=100
+SOLUTION_DELAY=15
+QUESTION_INTERVAL=30
+POLL_CLOSE_HOUR=23
+POLL_CLOSE_MINUTE=55
+
+# ── Database ──────────────────────────────────────────
+# For local dev:
+DB_PATH=norcet_bot.db
+# For Railway/Render (RECOMMENDED — mount a persistent volume first):
+# DB_PATH=/app/data/norcet_bot.db
+
+# ── Topics ────────────────────────────────────────────
+TOPICS_FILE=topics.txt
+
+# ── Gemini Generation ──────────────────────────────────
+BATCH_SIZE=5
+GEMINI_TEMPERATURE=0.6
+GEMINI_MAX_RETRIES=3
+GEMINI_RETRY_DELAY=5
+
+# ── Telegram Rate Limits ────────────────────────────────
+TELEGRAM_RATE_LIMIT=0.7
+MAX_TELEGRAM_RETRIES=3
+
+# ── Logging ────────────────────────────────────────────
+LOG_LEVEL=INFO
+LOG_FILE=norcet_bot.log
+
+# ── Difficulty Distribution ──────────────────────────
+DIFFICULTY_EASY=0.2
+DIFFICULTY_MODERATE=0.6
+DIFFICULTY_HARD=0.2
