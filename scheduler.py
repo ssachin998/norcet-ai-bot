@@ -4,8 +4,11 @@ NORCET AI Bot - Scheduler Module
 Manages scheduled quiz sessions using APScheduler.
 
 Schedules:
-    - Morning session: 7:00 AM IST (50 MCQ polls)
-    - Evening session: 7:00 PM IST (50 MCQ polls)
+    - Morning session: Config.MORNING_HOUR:MORNING_MINUTE IST
+      (Config.QUESTIONS_PER_SESSION MCQ polls — currently 60)
+    - Evening session: Config.EVENING_HOUR:EVENING_MINUTE IST
+      (Config.QUESTIONS_PER_SESSION MCQ polls — currently 60)
+    - 10-minute-before reminder for both sessions
 
 Uses APScheduler's AsyncIOScheduler for seamless integration
 with python-telegram-bot's event loop.
@@ -28,6 +31,18 @@ from topic_manager import TopicManager
 
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _minus_minutes(hour: int, minute: int, delta: int) -> tuple[int, int]:
+    """
+    Return (hour, minute) that is `delta` minutes before the given
+    hour:minute, wrapping correctly across midnight (e.g. 00:05 minus
+    10 -> 23:55 the previous day). Used to schedule the "test starts
+    in 10 minutes" reminder relative to the actual session time, so it
+    always stays 10 minutes ahead even if MORNING_HOUR/MINUTE change.
+    """
+    total = (hour * 60 + minute - delta) % (24 * 60)
+    return total // 60, total % 60
 
 
 class QuizScheduler:
@@ -68,6 +83,28 @@ class QuizScheduler:
         Configure the morning and evening quiz session jobs.
         Jobs use CronTrigger for precise daily scheduling.
         """
+        # Morning "test starts in 10 minutes" reminder
+        morning_reminder_hour, morning_reminder_minute = _minus_minutes(
+            Config.MORNING_HOUR, Config.MORNING_MINUTE, 10
+        )
+        self._scheduler.add_job(
+            self._run_morning_reminder,
+            trigger=CronTrigger(
+                hour=morning_reminder_hour,
+                minute=morning_reminder_minute,
+                timezone=Config.TIMEZONE,
+            ),
+            id="morning_reminder",
+            name="Morning Test Reminder",
+            replace_existing=True,
+            misfire_grace_time=120,
+            max_instances=1,
+        )
+        log.info(
+            f"Morning reminder scheduled at "
+            f"{morning_reminder_hour:02d}:{morning_reminder_minute:02d} {Config.TIMEZONE}"
+        )
+
         # Morning quiz session
         self._scheduler.add_job(
             self._run_morning_session,
@@ -85,6 +122,28 @@ class QuizScheduler:
         log.info(
             f"Morning quiz scheduled at "
             f"{Config.MORNING_HOUR:02d}:{Config.MORNING_MINUTE:02d} {Config.TIMEZONE}"
+        )
+
+        # Evening "test starts in 10 minutes" reminder
+        evening_reminder_hour, evening_reminder_minute = _minus_minutes(
+            Config.EVENING_HOUR, Config.EVENING_MINUTE, 10
+        )
+        self._scheduler.add_job(
+            self._run_evening_reminder,
+            trigger=CronTrigger(
+                hour=evening_reminder_hour,
+                minute=evening_reminder_minute,
+                timezone=Config.TIMEZONE,
+            ),
+            id="evening_reminder",
+            name="Evening Test Reminder",
+            replace_existing=True,
+            misfire_grace_time=120,
+            max_instances=1,
+        )
+        log.info(
+            f"Evening reminder scheduled at "
+            f"{evening_reminder_hour:02d}:{evening_reminder_minute:02d} {Config.TIMEZONE}"
         )
 
         # Evening quiz session
@@ -156,6 +215,59 @@ class QuizScheduler:
             await self._notify_admin(f"Evening session failed: {e}")
         finally:
             log.info("=== Evening Quiz Session Ended ===")
+
+    async def _run_morning_reminder(self) -> None:
+        """Send the 'test starts in 10 minutes' reminder for the Morning session."""
+        await self._send_test_reminder("Morning")
+
+    async def _run_evening_reminder(self) -> None:
+        """Send the 'test starts in 10 minutes' reminder for the Evening session."""
+        await self._send_test_reminder("Evening")
+
+    async def _send_test_reminder(self, session_type: str) -> None:
+        """
+        Post a pinned "test starts in 10 minutes" reminder to the quiz
+        channel, in the same style as other NORCET test-series bots
+        (hourglass header, topic line, countdown line, stay-online CTA).
+
+        Best-effort: if the send or pin fails (e.g. bot lacks pin rights
+        in the channel), it's logged and swallowed — a missing reminder
+        should never block or crash the actual quiz session that follows.
+        """
+        from utils import escape_html, parse_chat_id
+
+        chat_id = parse_chat_id(Config.QUIZ_CHAT_ID)
+        topic = self._topic_manager.current_topic
+        text = (
+            "\u23f3 <b>TEST REMINDER</b>\n\n"
+            f"\U0001f4d8 <b>NORCET Daily Quiz — {session_type} Session</b>\n"
+            f"Topic: <i>{escape_html(topic)}</i>\n"
+            f"\U0001f550 Your test will begin in 10 minutes "
+            f"({Config.QUESTIONS_PER_SESSION} MCQs).\n\n"
+            "\U0001f525 Please prepare yourself and stay online!"
+        )
+
+        try:
+            msg = await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_notification=False,
+            )
+            log.info(f"{session_type} reminder sent")
+        except Exception as e:
+            log.error(f"Failed to send {session_type} reminder: {e}", exc_info=True)
+            return
+
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            # Non-fatal — bot may not be admin/lack pin rights in this chat.
+            log.warning(f"Could not pin {session_type} reminder: {e}")
 
     async def _run_close_polls(self) -> None:
         """Execute the daily poll-closing sweep."""
