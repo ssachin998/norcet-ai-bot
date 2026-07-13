@@ -58,6 +58,7 @@ from database import (
     mark_polls_closed,
 )
 from gemini import gemini_client, GeminiRateLimiter
+from norcet_pyq import get_applicable_question_types
 from topic_manager import TopicManager
 from duplicate_checker import duplicate_checker
 from datetime import datetime, timezone, timedelta
@@ -414,6 +415,37 @@ async def _run_quiz_session_locked(
     # Pre-compute difficulty distribution for the session
     difficulties = generate_difficulty_distribution(total_questions)
 
+    # Question types applicable to this topic (clinical types normally,
+    # or the 4 General Aptitude types if the topic itself is aptitude/
+    # reasoning/English/computer). Computed ONCE per session (topic
+    # doesn't change mid-session) then cycled through — shuffled once,
+    # consumed in order, reshuffled when exhausted — so every type gets
+    # used roughly equally often across the session instead of a few
+    # types dominating by chance if each batch picked independently.
+    applicable_types = get_applicable_question_types(topic)
+    random.shuffle(applicable_types)
+    _type_cycle_idx = 0
+
+    def _next_batch_types(n: int) -> list[str]:
+        nonlocal _type_cycle_idx
+        picked = []
+        for _ in range(n):
+            if _type_cycle_idx >= len(applicable_types):
+                random.shuffle(applicable_types)
+                _type_cycle_idx = 0
+            picked.append(applicable_types[_type_cycle_idx])
+            _type_cycle_idx += 1
+        return picked
+
+    # Structured-vs-free split: the first FORCED_QUESTION_COUNT questions
+    # get the guaranteed type-cycling above; the rest are left to
+    # Gemini's own judgment on which types matter most for this topic
+    # (no forcing at all — see generate_question_batch's forced_types=None
+    # meaning). Requested split is 40 forced / 20 free out of a 60-question
+    # session; min() here just keeps it sane if QUESTIONS_PER_SESSION is
+    # ever configured smaller than 40.
+    FORCED_QUESTION_COUNT = min(40, total_questions)
+
     # ── Main loop: fetch in batches, post one-by-one on cadence ──
     posted_questions: list[dict] = []
     failed_count = 0
@@ -434,10 +466,16 @@ async def _run_quiz_session_locked(
             f"{batch_start + 1}-{batch_end} ({len(batch_difficulties)} q) "
             f"— 1 Gemini call"
         )
+        batch_types = (
+            _next_batch_types(len(batch_difficulties))
+            if batch_start < FORCED_QUESTION_COUNT
+            else None  # free choice — Gemini decides, no forcing
+        )
         try:
             batch_questions = await gemini_client.generate_question_batch(
                 topic=topic,
                 difficulties=batch_difficulties,
+                forced_types=batch_types,
             )
         except Exception as e:
             log.error(

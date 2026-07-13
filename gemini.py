@@ -30,7 +30,7 @@ import google.generativeai as genai
 from config import Config
 from logger import log
 from database import generate_question_hash
-from norcet_pyq import get_pyq_style_guidance
+from norcet_pyq import get_pyq_style_guidance, get_random_pyq_samples
 
 
 # ── Rate Limiter ──────────────────────────────────────────────
@@ -215,28 +215,17 @@ Return ONLY the JSON object. No markdown, no explanation, no code fences.
 BATCH_MCQ_PROMPT = """
 Generate exactly {count} NORCET-level Multiple Choice Questions on the topic: "{topic}"
 
+{real_pyq_examples}
+
 Assign each question one of these difficulty levels, IN THIS EXACT ORDER
 (question 1 gets the 1st difficulty listed, question 2 the 2nd, etc.):
 {difficulties}
 
-CRITICAL: You MUST vary the question type across the batch. Include a MIX of:
-- Clinical scenario + nursing action/priority (at least 3-4 questions)
-- Factual recall / lab value / drug dosage (at least 2 questions)
-- NOT / EXCEPT / negative framing (at least 1 question)
-- Priority / FIRST / IMMEDIATE action (at least 1 question)
-- MOST / BEST / LEAST superlative (at least 1 question)
-- Sequencing / ordering steps (at least 1 question if possible)
-- Differentiation / comparison (Condition A vs B) (at least 1 question)
-- Program / policy / national health scheme (at least 1 question if topic fits)
-- Lab value interpretation with specific units
-- Drug pharmacology / contraindication / side effect
-- Cause / reason / pathophysiology
-- Growth & development milestone
-- Emergency / critical care scenario
-- Mental health / psychiatric nursing
+{type_instruction}
 
 Do NOT repeat the same question pattern (e.g., do not make all questions start with
-'A patient presents with...'). Rotate formats aggressively.
+'A patient presents with...') even when consecutive questions share a difficulty or
+topic — vary the phrasing/scenario framing aggressively.
 
 Return a JSON array (a list) of exactly {count} objects. Each object must have EXACTLY these fields:
 {{
@@ -247,7 +236,7 @@ Return a JSON array (a list) of exactly {count} objects. Each object must have E
   "optionD": "Fourth option (HARD LIMIT: under 90 characters)",
   "correct_answer": "The correct option letter — exactly A, B, C, or D",
   "difficulty": "Easy | Moderate | Hard",
-  "question_type": "One of: clinical_scenario, factual_recall, negative_framing, priority_first, superlative, lab_interpretation, pharmacology, anatomy, sequencing, program_policy, differentiation, emergency, milestone, cause_reason, mental_health, nutrition, infection_control, community_health, vital_sign_trend",
+  "question_type": "The type actually used for this question — normally the one assigned to this position above, but substituted with a better-fitting type from the same list if the assigned one didn't suit this topic. Must always reflect the truth of what you wrote.",
   "correct_rationale": "Detailed explanation of why the correct answer is correct. Include pathophysiology, pharmacology, or clinical reasoning. 2-4 sentences.",
   "rationale_wrong_options": {{
     "A": "Why option A is wrong (2-3 sentences)",
@@ -667,6 +656,7 @@ class GeminiClient:
         self,
         topic: str,
         difficulties: list[str],
+        question_types: list[str] | None,
         _depth: int = 0,
     ) -> list[dict]:
         """
@@ -682,15 +672,51 @@ class GeminiClient:
           2. If it keeps failing, split the batch in half and fetch each
              half separately — smaller batches need fewer output tokens
              and are much less likely to hit the ceiling.
-          3. Stop splitting at batch size 2; if that still fails, give up
-             on that slice (raises, caller logs + skips just that slice
-             instead of the whole original batch).
+          3. Stop splitting at batch size 1 (can't split further); if
+             that still fails, give up on that slice (raises, caller
+             logs + skips just that slice instead of the whole batch).
+
+        question_types: None means Gemini chooses freely (no forcing at
+        all) — kept in lockstep with difficulties when it IS a list, so
+        it survives the fallback/split path intact.
         """
         count = len(difficulties)
+
+        if question_types is not None:
+            type_instruction = (
+                "Assign each question one of these question TYPES, IN THIS EXACT ORDER\n"
+                "(question 1 targets the 1st type listed, question 2 the 2nd, etc — this\n"
+                "guarantees real variety instead of leaving type choice up to chance).\n"
+                "IMPORTANT: if the assigned type for a question genuinely does not fit\n"
+                "this topic (e.g. \"program_policy\" doesn't naturally apply to a pure\n"
+                "Anatomy topic), do NOT force an awkward/contrived question — instead\n"
+                "pick the closest type from the full list above that DOES fit the topic\n"
+                "well, and set that question's \"question_type\" field to what you\n"
+                "actually used (not the originally assigned one). Quality and topic-fit\n"
+                "always come before matching the assigned type exactly.\n"
+                f"{', '.join(question_types)}"
+            )
+        else:
+            type_instruction = (
+                "For THIS batch, you choose the question types freely — no fixed "
+                "assignment. Use the full style guide above as your menu and pick "
+                "whichever mix of types you judge most valuable and exam-relevant "
+                "for this specific topic. Still vary types across the batch rather "
+                "than repeating one pattern, and set each question's "
+                "\"question_type\" field to whatever you actually used."
+            )
+
         prompt = BATCH_MCQ_PROMPT.format(
             topic=topic,
             count=count,
             difficulties=", ".join(difficulties),
+            type_instruction=type_instruction,
+            # Freshly randomized each call — unlike the SYSTEM_INSTRUCTION's
+            # style guidance (computed once at startup and fixed for the
+            # process's lifetime), this rotates which real PYQ examples
+            # Gemini sees, so quality calibration doesn't go stale over
+            # hundreds of calls.
+            real_pyq_examples=get_random_pyq_samples(topic=topic, n=5),
         )
 
         last_error: Exception | None = None
@@ -720,12 +746,16 @@ class GeminiClient:
         )
         mid = max(1, count // 2)
         first_half, second_half = difficulties[:mid], difficulties[mid:]
+        if question_types is not None:
+            first_types, second_types = question_types[:mid], question_types[mid:]
+        else:
+            first_types, second_types = None, None
 
         results: list[dict] = []
-        for half in (first_half, second_half):
+        for half, half_types in ((first_half, first_types), (second_half, second_types)):
             try:
                 results.extend(
-                    await self._fetch_batch_with_fallback(topic, half, _depth + 1)
+                    await self._fetch_batch_with_fallback(topic, half, half_types, _depth + 1)
                 )
             except ValueError as e:
                 log.error(
@@ -741,6 +771,7 @@ class GeminiClient:
         self,
         topic: str,
         difficulties: list[str],
+        forced_types: list[str] | None = None,
     ) -> list[dict]:
         """
         Generate `len(difficulties)` fully-merged questions (MCQ +
@@ -755,6 +786,18 @@ class GeminiClient:
             topic: The NORCET topic.
             difficulties: List of difficulty strings, one per question,
                           in the order they should be assigned.
+            forced_types: List of question_type ids, one per question,
+                          in the order they should be assigned (same
+                          pattern as difficulties) — guarantees type
+                          variety instead of leaving it up to Gemini.
+                          If None (default), NO type is forced at all —
+                          Gemini picks freely from the full style guide,
+                          using its own judgment on what's most valuable
+                          for this topic. Callers that want guaranteed
+                          rotation (see telegram_poll.py) pass an
+                          explicit list; callers happy to let Gemini
+                          decide (e.g. a deliberate "free" portion of a
+                          session) just omit this argument.
 
         Returns:
             List of question dicts, each already merged with its
@@ -769,7 +812,14 @@ class GeminiClient:
             ValueError: If the response can't be parsed as a JSON array.
         """
         count = len(difficulties)
-        raw_items = await self._fetch_batch_with_fallback(topic, difficulties)
+
+        if forced_types is not None and len(forced_types) != count:
+            raise ValueError(
+                f"forced_types length ({len(forced_types)}) must match "
+                f"difficulties length ({count})"
+            )
+
+        raw_items = await self._fetch_batch_with_fallback(topic, difficulties, forced_types)
 
         required = {
             "question", "optionA", "optionB", "optionC", "optionD",

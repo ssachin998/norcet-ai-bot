@@ -371,6 +371,69 @@ QUESTION_TYPES = [
         ),
         "pyq_example": "",
     },
+    # ── General Aptitude / Reasoning section ──────────────────
+    # NORCET papers include a non-clinical General Aptitude section
+    # (logical reasoning, verbal reasoning, English, computer
+    # awareness) alongside the nursing-subject questions above. These
+    # types should ONLY be used for a topic that IS the aptitude
+    # section (e.g. "General Aptitude & Reasoning") — mixing a seating
+    # arrangement puzzle into a Cardiovascular System batch would be
+    # thematically wrong. See BATCH_MCQ_PROMPT in gemini.py for how
+    # this is gated by topic.
+    {
+        "type": "logical_reasoning",
+        "description": (
+            "Non-clinical logical/analytical reasoning: seating "
+            "arrangements, blood relations, syllogisms, coding-decoding, "
+            "direction sense, series completion."
+        ),
+        "prompt_instruction": (
+            "Write a self-contained logic puzzle (seating arrangement, "
+            "blood relation, coding-decoding, or series) with a single "
+            "unambiguous correct answer."
+        ),
+        "pyq_example": (
+            "P, Q, R, S, T, U are sitting in a circle. Q is sitting 2nd left to P. "
+            "T is between Q and R. S is not the neighbour of P. Who is sitting right to R?"
+        ),
+    },
+    {
+        "type": "verbal_reasoning",
+        "description": (
+            "Word-based reasoning: jumbled words/letters, analogies, "
+            "odd-one-out, word relationships."
+        ),
+        "prompt_instruction": (
+            "Write a word-puzzle question — rearrange jumbled letters into "
+            "a meaningful word, or an analogy/odd-one-out question."
+        ),
+        "pyq_example": "Rearrange the alphabet into a meaningful word: CIFIAPC",
+    },
+    {
+        "type": "english_language",
+        "description": (
+            "Basic English usage: synonyms, antonyms, grammar, sentence "
+            "correction, one-word substitution."
+        ),
+        "prompt_instruction": (
+            "Ask for a synonym, antonym, correct grammatical form, or "
+            "one-word substitution of a common English word."
+        ),
+        "pyq_example": "Choose the antonym of the word amicable.",
+    },
+    {
+        "type": "computer_knowledge",
+        "description": (
+            "Basic computer/IT awareness: hardware, software, storage "
+            "devices, internet/networking basics, MS Office basics."
+        ),
+        "prompt_instruction": (
+            "Ask a basic computer-awareness fact question (hardware "
+            "component, storage speed/type, common software function, "
+            "or basic networking term)."
+        ),
+        "pyq_example": "Which of the following has the fastest data access speed?",
+    },
 ]
 
 
@@ -430,60 +493,45 @@ def get_pyq_style_guidance() -> str:
     """
     Return a comprehensive style guide string for the Gemini prompt,
     compiled from PYQ analysis.
+
+    FIX: this used to be a hand-typed string that only embedded a real
+    pyq_example for ~3 of the 20 QUESTION_TYPES entries (the other 17
+    had rich, genuine examples sitting in QUESTION_TYPES that never
+    actually reached the prompt). This version builds itself FROM
+    QUESTION_TYPES programmatically, so every type that has a real
+    example includes it here.
     """
-    return (
-        "NORCET PYQ QUESTION STYLE GUIDE (based on NORCET-10 Prelims & Mains analysis):\n\n"
+    lines = [
+        "NORCET PYQ QUESTION STYLE GUIDE (based on NORCET-10 Prelims & Mains analysis):\n",
         "VARIETY REQUIREMENT - Every batch MUST include a MIX of these question types. "
-        "Do NOT generate all questions in the same format. Rotate through:\n\n"
-        "1. CLINICAL SCENARIO + NURSING ACTION (highest weight ~20%):\n"
-        "   Describe patient, setting, vitals/findings. Ask: 'What should the nurse do FIRST?' "
-        "or 'Which nursing intervention is correct?'\n"
-        "   Example: 'A 45-year-old patient is rushed into the emergency department with "
-        "severe abdominal pain... blood glucose 520 mg/dL... What should be the first nursing action?'\n\n"
-        "2. FACTUAL RECALL (~15%):\n"
-        "   Direct factual question: lab cutoff, drug dosage, normal range, definition.\n"
-        "   Example: 'The fasting blood glucose (FBS) cut-off value for diagnosis of diabetes mellitus is?'\n\n"
-        "3. NEGATIVE FRAMING - NOT / EXCEPT (~8%):\n"
-        "   'All of the following are correct EXCEPT' or 'Which is NOT a sign of...'\n"
-        "   Three correct options, one wrong (or vice versa).\n\n"
-        "4. PRIORITY / FIRST ACTION (~10%):\n"
-        "   'What should the nurse do FIRST?' or 'IMMEDIATE action'\n"
-        "   Use ABC framework, Maslow hierarchy, or nursing process.\n\n"
-        "5. SUPERLATIVE - MOST / BEST / LEAST (~8%):\n"
-        "   'MOST important benefit', 'BEST approach', 'LEAST likely'\n"
-        "   All options plausible but one clearly superior.\n\n"
-        "6. LAB VALUE INTERPRETATION (~8%):\n"
-        "   Provide specific lab values with units. Ask for interpretation or staging.\n"
-        "   Example: 'Urine output 20 mL/hr, serum creatinine 3.6 mg/dL. RIFLE stage?'\n\n"
-        "7. DRUG / PHARMACOLOGY (~8%):\n"
-        "   Drug action, contraindication, side effect, administration route, nursing consideration.\n\n"
-        "8. ANATOMY / STRUCTURE (~5%):\n"
-        "   Anatomical landmarks, injection sites, nerves, vessels.\n\n"
-        "9. SEQUENCING / ORDERING (~3%):\n"
-        "   List 3-5 steps. Ask to arrange in correct order.\n"
-        "   Present options as sequences like '4>3>1>2'.\n\n"
-        "10. PROGRAM / POLICY (~5%):\n"
-        "   LaQshya, RCH, NHM, JSSK, PMSMA, ASHA, ANM norms.\n\n"
-        "11. DIFFERENTIATION / COMPARISON (~5%):\n"
-        "   'What differentiates Condition A from Condition B?'\n\n"
-        "12. EMERGENCY / CRITICAL CARE (~5%):\n"
-        "   DKA, shock, hemorrhage, cardiac arrest, CPR, burns, poisoning.\n\n"
-        "13. GROWTH & DEVELOPMENT MILESTONES (~3%):\n"
-        "   Pregnancy milestones, developmental norms, immunization schedule.\n\n"
-        "14. VITAL SIGN TREND INTERPRETATION (~2%):\n"
-        "   Series of vital signs over time. Ask what condition the trend indicates.\n\n"
-        "15. CAUSE / REASON (~3%):\n"
-        "   'This symptom is due to which cause?' - pathophysiology reasoning.\n\n"
-        "16. MENTAL HEALTH / PSYCHIATRY (~3%):\n"
-        "   Therapeutic communication, treatment approach, coping mechanisms.\n\n"
-        "17. PROCEDURE / SKILL (~3%):\n"
-        "   Nursing procedure technique, equipment, patient preparation.\n\n"
-        "18. COMMUNITY HEALTH / STATISTICS (~2%):\n"
-        "   Epidemiological rates, survey methods, vital statistics.\n\n"
-        "19. INFECTION CONTROL (~2%):\n"
-        "   Asepsis, isolation precautions, PPE, sterilisation.\n\n"
-        "20. NUTRITION / METABOLIC (~2%):\n"
-        "   BMI, malnutrition, vitamin deficiencies, diet recommendations.\n\n"
+        "Do NOT generate all questions in the same format. Rotate through:\n",
+    ]
+    for i, qt in enumerate(QUESTION_TYPES, 1):
+        label = qt["type"].replace("_", " ").upper()
+        lines.append(f"{i}. {label}:")
+        lines.append(f"   {qt['prompt_instruction']}")
+        if qt.get("pyq_example"):
+            lines.append(f"   Real PYQ-style example: \"{qt['pyq_example']}\"")
+        lines.append("")
+
+    lines.append(
+        "IMPORTANT — TOPIC GATING: the last 4 types above (Logical Reasoning, "
+        "Verbal Reasoning, English Language, Computer Knowledge) are a separate "
+        "General Aptitude section of NORCET, NOT nursing content. Use them ONLY "
+        "if the topic given to you IS itself about general aptitude, reasoning, "
+        "English, or computer knowledge. For any clinical/nursing topic "
+        "(Anatomy, Pharmacology, Medical-Surgical Nursing, etc.), ignore these "
+        "4 entirely and draw only from the clinical types above.\n"
+    )
+    lines.append(
+        "NOTE: this list covers the most common NORCET patterns, but is not "
+        "exhaustive — if the topic and difficulty naturally call for a valid "
+        "question format not listed here (e.g. a numerical dosage calculation, "
+        "match-the-following, or a short multi-statement assertion-reason "
+        "question), use good judgment rather than forcing every question into "
+        "one of the categories above.\n"
+    )
+    lines.append(
         "STYLE RULES:\n"
         "- Questions should be concise (1-3 sentences for stem)\n"
         "- Options should be plausible and similar in length\n"
@@ -493,3 +541,119 @@ def get_pyq_style_guidance() -> str:
         "- Clinical scenarios should specify age, gender, setting, and key findings\n"
         "- Question difficulty should match the assigned level (Easy/Moderate/Hard)\n"
     )
+    return "\n".join(lines)
+
+
+# Types that belong to NORCET's General Aptitude section, not nursing
+# content — kept separate so random sampling doesn't leak a seating-
+# arrangement or antonym example into a clinical topic's prompt.
+_APTITUDE_TYPES = {"logical_reasoning", "verbal_reasoning", "english_language", "computer_knowledge"}
+
+# Specific phrases, not bare single words — "computer" or "reasoning"
+# alone are too loose (see _NURSING_CONTEXT_WORDS below for why).
+_APTITUDE_POSITIVE_PHRASES = (
+    "general aptitude",
+    "logical reasoning",
+    "verbal reasoning",
+    "english language",
+    "computer knowledge",
+    "computer awareness",
+    "computer fundamentals",
+    "quantitative aptitude",
+    "numerical ability",
+    "reasoning ability",
+    "reasoning & aptitude",
+    "reasoning and aptitude",
+    "general knowledge",
+    " gk",
+    "gk ",
+)
+
+# If a topic contains ANY of these, it's a real nursing/clinical
+# subject no matter what else it mentions — overrides the positive
+# phrases above. This is what correctly keeps "Computer Applications
+# in Nursing" and "Clinical Reasoning in Nursing Practice" classified
+# as clinical topics instead of General Aptitude, even though they
+# contain "computer"/"reasoning".
+_NURSING_CONTEXT_WORDS = (
+    "nursing", "clinical", "patient", "health", "medical", "care",
+    "informatics", "hospital", "disease", "therapy", "treatment",
+    "diagnosis", "surgical", "pediatric", "obstetric", "psychiatric",
+)
+
+
+def _is_aptitude_topic(topic: str) -> bool:
+    """
+    Decide whether a topic belongs to NORCET's General Aptitude
+    section (logical/verbal reasoning, English, computer knowledge)
+    versus a nursing/clinical subject.
+
+    Nursing-context words always win, even over a positive aptitude
+    phrase match — a topic like "Computer Applications in Nursing" or
+    "Clinical Reasoning in Nursing Practice" is real nursing content,
+    not general computer-literacy or logic-puzzle material, despite
+    containing "computer"/"reasoning".
+    """
+    topic_lower = topic.lower()
+    if any(w in topic_lower for w in _NURSING_CONTEXT_WORDS):
+        return False
+    return any(phrase in topic_lower for phrase in _APTITUDE_POSITIVE_PHRASES)
+
+
+def get_applicable_question_types(topic: str) -> list[str]:
+    """
+    Return the list of question-type ids applicable to a topic —
+    clinical types for a nursing subject, or the 4 General Aptitude
+    types if the topic itself is about aptitude/reasoning/English/
+    computer knowledge. Same gating logic as get_random_pyq_samples(),
+    exposed separately so callers (generate_question_batch,
+    telegram_poll.py) can FORCE a specific type per question rather
+    than just showing examples and hoping Gemini varies them.
+    """
+    if _is_aptitude_topic(topic):
+        return [qt["type"] for qt in QUESTION_TYPES if qt["type"] in _APTITUDE_TYPES]
+    return [qt["type"] for qt in QUESTION_TYPES if qt["type"] not in _APTITUDE_TYPES]
+
+
+def get_random_pyq_samples(topic: str = "", n: int = 5) -> str:
+    """
+    Return n real PYQ-style examples, EACH FROM A DIFFERENT question
+    type (picked randomly from QUESTION_TYPES, which is type-tagged).
+
+    Topic-aware: if `topic` looks like a General Aptitude/Reasoning/
+    English/Computer topic, samples are drawn ONLY from those 4 types.
+    Otherwise (the normal nursing-subject case), those 4 are excluded
+    entirely so a clinical topic never gets a stray reasoning-puzzle
+    or antonym example mixed into its style guidance.
+
+    FIX: this used to random.sample() from the flat, untagged
+    PRELIMS_PYQ_SAMPLES + MAINS_PYQ_SAMPLES pool — nothing stopped it
+    from picking 4 examples that were all "clinical scenario" style by
+    chance, missing rarer types like sequencing or differentiation
+    entirely in a given call. Sampling from QUESTION_TYPES instead
+    guarantees the n examples shown are always n DIFFERENT types, and
+    each is labeled with its type so Gemini sees a concrete example
+    matching each style it's asked to vary across, not just an
+    abstract instruction to "mix it up."
+
+    Default n=5 roughly matches Config.BATCH_SIZE (5 questions/call),
+    so there's about one type-example per question generated.
+    """
+    import random
+
+    if _is_aptitude_topic(topic):
+        typed = [qt for qt in QUESTION_TYPES if qt["type"] in _APTITUDE_TYPES and qt.get("pyq_example")]
+    else:
+        typed = [qt for qt in QUESTION_TYPES if qt["type"] not in _APTITUDE_TYPES and qt.get("pyq_example")]
+
+    n = min(n, len(typed))
+    picks = random.sample(typed, n)
+    lines = [
+        "REAL NORCET PYQ EXAMPLES — each a DIFFERENT question type "
+        "(for style calibration only — do NOT copy these, write NEW "
+        "original questions in this style):"
+    ]
+    for i, qt in enumerate(picks, 1):
+        label = qt["type"].replace("_", " ").title()
+        lines.append(f"{i}. [{label}] \"{qt['pyq_example']}\"")
+    return "\n".join(lines)
