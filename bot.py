@@ -31,6 +31,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackContext,
+    CallbackQueryHandler,
 )
 
 from config import Config
@@ -39,6 +40,7 @@ from database import init_database
 from topic_manager import TopicManager
 from scheduler import QuizScheduler
 from telegram_poll import post_immediate_session
+from topic_picker import cmd_jump_topic, handle_jump_topic_callback
 from utils import escape_html, parse_chat_id
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -206,37 +208,6 @@ async def cmd_skip(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(msg, parse_mode="HTML")
     except Exception as e:
         log.error(f"Failed to skip topic: {e}")
-        await update.message.reply_text(f"Error: {e}")
-
-
-async def cmd_jump_topic(update: Update, context: CallbackContext) -> None:
-    """Handle /jumptopic <name> command — switch topic from Telegram, no redeploy."""
-    if not is_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/jumptopic &lt;topic name&gt;</code>\n"
-            "Example: <code>/jumptopic Biochemistry</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    name = " ".join(context.args)
-    try:
-        old_topic = topic_manager.current_topic
-        new_topic = topic_manager.jump_to_topic_by_name(name)
-        msg = (
-            f"<b>🎯 Jumped to Topic</b>\n\n"
-            f"Previous: <i>{escape_html(old_topic)}</i>\n"
-            f"Current: <i>{escape_html(new_topic)}</i>\n"
-            f"Progress: {topic_manager.current_index + 1}/{topic_manager.total_topics}"
-        )
-        await update.message.reply_text(msg, parse_mode="HTML")
-    except ValueError as e:
-        await update.message.reply_text(f"❌ {escape_html(str(e))}", parse_mode="HTML")
-    except Exception as e:
-        log.error(f"Failed to jump topic: {e}")
         await update.message.reply_text(f"Error: {e}")
 
 
@@ -666,6 +637,10 @@ async def post_init(application: Application) -> None:
     topic_manager = TopicManager()
     log.info(f"Topic manager ready: {topic_manager.total_topics} topics loaded")
 
+    # Shared with topic_picker.py's command/callback handlers — avoids a
+    # circular import (topic_picker.py doesn't import bot.py).
+    application.bot_data["topic_manager"] = topic_manager
+
     # Set up bot commands
     commands = [
         BotCommand("start", "Start the bot"),
@@ -790,6 +765,7 @@ def main() -> None:
     application.add_handler(CommandHandler("pyq", cmd_pyq))
     application.add_handler(CommandHandler("schedule", cmd_schedule))
     application.add_handler(CommandHandler("jumptopic", cmd_jump_topic))
+    application.add_handler(CallbackQueryHandler(handle_jump_topic_callback, pattern=r"^jt:"))
     application.add_handler(CommandHandler("addtopic", cmd_add_topic))
     application.add_handler(CommandHandler("setschedule", cmd_set_schedule))
 

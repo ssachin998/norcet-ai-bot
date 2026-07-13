@@ -8,6 +8,7 @@ Reads topics from topics.txt and maintains position in the SQLite database.
 """
 
 import os
+import re
 from typing import Optional
 
 from config import Config
@@ -293,14 +294,52 @@ class TopicManager:
         )
         return target_topic
 
+    def search_topics(self, query: str) -> list[tuple[int, str]]:
+        """
+        Search topics by query, returning ALL matches as (index, name)
+        pairs — unlike jump_to_topic_by_name(), this never raises on
+        an ambiguous query. Used by the /jumptopic picker
+        (topic_picker.py) so the admin can tap-select from a list
+        instead of needing to type an exact, unambiguous name.
+
+        Same 3-tier strategy: exact > substring > word-set (ignores
+        hyphens/punctuation/word order).
+        """
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return []
+
+        # 1. Exact match
+        for i, t in enumerate(self._topics):
+            if t.lower() == query_lower:
+                return [(i, t)]
+
+        # 2. Substring match
+        substring_matches = [
+            (i, t) for i, t in enumerate(self._topics) if query_lower in t.lower()
+        ]
+        if substring_matches:
+            return substring_matches
+
+        # 3. Word-set match
+        query_words = set(re.findall(r"[a-z0-9]+", query_lower))
+        if not query_words:
+            return []
+        return [
+            (i, t) for i, t in enumerate(self._topics)
+            if query_words.issubset(set(re.findall(r"[a-z0-9]+", t.lower())))
+        ]
+
     def jump_to_topic_by_name(self, name: str) -> str:
         """
-        Jump to a topic by (case-insensitive, partial-match) name.
-        Used by the /jumptopic admin command — names are much easier
-        to type correctly than remembering a numeric index.
+        Jump to a topic by name — deliberately forgiving (see
+        search_topics() for the matching strategy). Used for
+        non-interactive callers; /jumptopic itself uses
+        search_topics() directly via topic_picker.py so it can offer
+        a tappable list instead of just erroring on ambiguity.
 
         Args:
-            name: Topic name, or a distinctive substring of it.
+            name: Topic name, or a distinctive word/phrase from it.
 
         Returns:
             The name of the new current topic.
@@ -308,24 +347,19 @@ class TopicManager:
         Raises:
             ValueError: If no topic matches, or more than one does.
         """
-        name_lower = name.strip().lower()
-
-        # Exact match first
-        for i, t in enumerate(self._topics):
-            if t.lower() == name_lower:
-                return self.jump_to_topic(i)
-
-        # Fall back to substring match, but only if unambiguous
-        matches = [i for i, t in enumerate(self._topics) if name_lower in t.lower()]
+        matches = self.search_topics(name)
         if not matches:
             raise ValueError(f"No topic matches '{name}'.")
         if len(matches) > 1:
-            options = ", ".join(f"'{self._topics[i]}'" for i in matches)
+            shown = matches[:5]
+            options = ", ".join(f"'{t}'" for _, t in shown)
+            extra = f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
             raise ValueError(
-                f"'{name}' matches multiple topics: {options}. "
+                f"'{name}' matches multiple topics: {options}{extra}. "
                 "Be more specific."
             )
-        return self.jump_to_topic(matches[0])
+        index, _ = matches[0]
+        return self.jump_to_topic(index)
 
     def add_topic(self, name: str) -> bool:
         """
