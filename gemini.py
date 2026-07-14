@@ -253,6 +253,12 @@ Requirements:
 - Every question must test clinical application or reasoning.
 - All four options must be plausible and similar in length.
 - The correct answer must be unambiguously correct.
+- EVERY question — including sequencing/ordering ones — MUST include a
+  "correct_answer" field set to exactly A, B, C, or D. For a sequencing
+  question, make each option (optionA-D) a complete candidate order
+  (e.g. "3-1-4-2"), then set "correct_answer" to whichever option
+  letter holds the correct order — never omit this field, and never
+  put the order itself in "correct_answer" instead of a letter.
 - Each rationale must explain WHY with clinical reasoning.
 - The reference must be a REAL textbook citation.
 - No two questions in this batch may repeat the same question pattern.
@@ -767,6 +773,70 @@ class GeminiClient:
 
     # ── Public: generate a BATCH of questions (question+explanation) ──
 
+    def _validate_batch_items(
+        self, raw_items: list, difficulties: list[str], topic: str
+    ) -> tuple[list[dict], list[int]]:
+        """
+        Validate and normalize raw batch items from Gemini.
+
+        Returns (valid_questions, dropped_indices) — dropped_indices
+        (positions in raw_items/difficulties that failed validation)
+        lets the caller request a precise top-up for exactly the
+        difficulty/type slots that were lost, instead of just quietly
+        accepting a shorter-than-requested batch.
+        """
+        required = {
+            "question", "optionA", "optionB", "optionC", "optionD",
+            "correct_answer", "correct_rationale",
+        }
+
+        questions: list[dict] = []
+        dropped_indices: list[int] = []
+
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                log.warning(f"Batch item {idx}: not a JSON object, skipping")
+                dropped_indices.append(idx)
+                continue
+
+            missing = required - set(item.keys())
+            if missing:
+                log.warning(f"Batch item {idx}: missing fields {missing}, skipping")
+                dropped_indices.append(idx)
+                continue
+
+            correct = str(item["correct_answer"]).strip().upper()
+            if correct not in {"A", "B", "C", "D"}:
+                log.warning(f"Batch item {idx}: invalid correct_answer '{correct}', skipping")
+                dropped_indices.append(idx)
+                continue
+
+            wrong = item.get("rationale_wrong_options", {}) or {}
+            correct_rat = str(item.get("correct_rationale", "")).strip()
+
+            fallback_difficulty = difficulties[idx] if idx < len(difficulties) else "Moderate"
+
+            questions.append({
+                "question": str(item["question"]).strip(),
+                "optionA": str(item["optionA"]).strip(),
+                "optionB": str(item["optionB"]).strip(),
+                "optionC": str(item["optionC"]).strip(),
+                "optionD": str(item["optionD"]).strip(),
+                "correct_answer": correct,
+                "difficulty": str(item.get("difficulty", fallback_difficulty)).strip().title(),
+                "question_type": str(item.get("question_type", "")).strip(),
+                "topic": topic,
+                "rationaleA": correct_rat if correct == "A" else str(wrong.get("A", "")).strip(),
+                "rationaleB": correct_rat if correct == "B" else str(wrong.get("B", "")).strip(),
+                "rationaleC": correct_rat if correct == "C" else str(wrong.get("C", "")).strip(),
+                "rationaleD": correct_rat if correct == "D" else str(wrong.get("D", "")).strip(),
+                "memory_trick": str(item.get("memory_trick", "")).strip(),
+                "pearl": str(item.get("pearl", "")).strip(),
+                "reference": str(item.get("reference", "")).strip(),
+            })
+
+        return questions, dropped_indices
+
     async def generate_question_batch(
         self,
         topic: str,
@@ -803,9 +873,10 @@ class GeminiClient:
             List of question dicts, each already merged with its
             explanation (question, optionA-D, correct_answer,
             difficulty, rationaleA-D, memory_trick, pearl, reference,
-            topic). Items that fail validation are skipped (not raised),
-            so the returned list may be shorter than `difficulties`
-            if the model returns a malformed item.
+            topic). A single top-up call is made if any item fails
+            validation (e.g. missing "correct_answer"), so the
+            returned list matches `len(difficulties)` in all but the
+            rare case where even the top-up also has a bad item.
 
         Raises:
             RuntimeError: If the whole batch call fails after retries.
@@ -820,51 +891,45 @@ class GeminiClient:
             )
 
         raw_items = await self._fetch_batch_with_fallback(topic, difficulties, forced_types)
+        questions, dropped_indices = self._validate_batch_items(raw_items, difficulties, topic)
 
-        required = {
-            "question", "optionA", "optionB", "optionC", "optionD",
-            "correct_answer", "correct_rationale",
-        }
-
-        questions: list[dict] = []
-        for idx, item in enumerate(raw_items):
-            if not isinstance(item, dict):
-                log.warning(f"Batch item {idx}: not a JSON object, skipping")
-                continue
-
-            missing = required - set(item.keys())
-            if missing:
-                log.warning(f"Batch item {idx}: missing fields {missing}, skipping")
-                continue
-
-            correct = str(item["correct_answer"]).strip().upper()
-            if correct not in {"A", "B", "C", "D"}:
-                log.warning(f"Batch item {idx}: invalid correct_answer '{correct}', skipping")
-                continue
-
-            wrong = item.get("rationale_wrong_options", {}) or {}
-            correct_rat = str(item.get("correct_rationale", "")).strip()
-
-            fallback_difficulty = difficulties[idx] if idx < len(difficulties) else "Moderate"
-
-            questions.append({
-                "question": str(item["question"]).strip(),
-                "optionA": str(item["optionA"]).strip(),
-                "optionB": str(item["optionB"]).strip(),
-                "optionC": str(item["optionC"]).strip(),
-                "optionD": str(item["optionD"]).strip(),
-                "correct_answer": correct,
-                "difficulty": str(item.get("difficulty", fallback_difficulty)).strip().title(),
-                "question_type": str(item.get("question_type", "")).strip(),
-                "topic": topic,
-                "rationaleA": correct_rat if correct == "A" else str(wrong.get("A", "")).strip(),
-                "rationaleB": correct_rat if correct == "B" else str(wrong.get("B", "")).strip(),
-                "rationaleC": correct_rat if correct == "C" else str(wrong.get("C", "")).strip(),
-                "rationaleD": correct_rat if correct == "D" else str(wrong.get("D", "")).strip(),
-                "memory_trick": str(item.get("memory_trick", "")).strip(),
-                "pearl": str(item.get("pearl", "")).strip(),
-                "reference": str(item.get("reference", "")).strip(),
-            })
+        # FIX: a batch item can fail validation (e.g. Gemini forgets
+        # "correct_answer" on a complex sequencing/ordering question)
+        # while the REST of the batch is fine — this used to just be
+        # accepted as a shorter batch (e.g. "4/5 valid questions"),
+        # meaning the session quietly finished 1 question short. One
+        # top-up call for exactly the dropped slots (same difficulty +
+        # forced type) closes that gap instead of losing the question.
+        if dropped_indices:
+            shortfall = len(dropped_indices)
+            log.info(
+                f"{shortfall}/{count} item(s) failed validation — "
+                "requesting a top-up batch to make up the difference."
+            )
+            topup_difficulties = [
+                difficulties[i] if i < len(difficulties) else "Moderate"
+                for i in dropped_indices
+            ]
+            topup_types = None
+            if forced_types is not None:
+                topup_types = [
+                    forced_types[i] if i < len(forced_types) else forced_types[-1]
+                    for i in dropped_indices
+                ]
+            try:
+                topup_raw = await self._fetch_batch_with_fallback(
+                    topic, topup_difficulties, topup_types
+                )
+                topup_questions, _ = self._validate_batch_items(
+                    topup_raw, topup_difficulties, topic
+                )
+                questions.extend(topup_questions)
+                log.info(f"Top-up added {len(topup_questions)}/{shortfall} question(s).")
+            except Exception as e:
+                log.warning(
+                    f"Top-up batch also failed ({e}) — proceeding with "
+                    f"{len(questions)}/{count}."
+                )
 
         log.info(f"Batch generated: {len(questions)}/{count} valid questions")
         return questions
